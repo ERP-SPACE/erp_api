@@ -130,6 +130,8 @@ jobs:
           jq --arg image "$NEW_IMAGE_TAG_NAME" '.containerDefinitions[0].image=$image' erp-backend-service-prod > "$tmp" && mv "$tmp" erp-backend-service-prod
           chmod 777 erp-backend-service-prod.json
 
+          
+
       - name: Update ECS service for Erp Backend Service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
