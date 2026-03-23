@@ -89,6 +89,5 @@
   },
   "registeredAt": "2026-03-22T22:04:33.216Z",
   "registeredBy": "arn:aws:iam::602664593558:user/bhavik-devops",
-  "enableFaultInjection": false,
   "tags": []
 }
