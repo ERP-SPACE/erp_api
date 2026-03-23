@@ -1,31 +1,94 @@
 {
-  "name": "livesocial-backend-service-prod",
-  "image": "602664593558.dkr.ecr.ap-south-1.amazonaws.com/prod/erp-web-app@sha256:d401201ed15c76c2b95bc63cce7fa6aee60712de8113cf09135d07290d5b0a39",
-  "cpu": 0,
-  "portMappings": [
+  "taskDefinitionArn": "arn:aws:ecs:ap-south-1:602664593558:task-definition/livesocial-backend-service-prod:2",
+  "containerDefinitions": [
     {
-      "name": "backend-port",
-      "containerPort": 5000,
-      "hostPort": 5000,
-      "protocol": "tcp",
-      "appProtocol": "http"
+      "name": "livesocial-backend-service-prod",
+      "image": "602664593558.dkr.ecr.ap-south-1.amazonaws.com/prod/erp-web-app@sha256:d401201ed15c76c2b95bc63cce7fa6aee60712de8113cf09135d07290d5b0a39",
+      "cpu": 0,
+      "portMappings": [
+        {
+          "name": "backend-port",
+          "containerPort": 5000,
+          "hostPort": 5000,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        }
+      ],
+      "essential": true,
+      "environment": [],
+      "environmentFiles": [],
+      "mountPoints": [],
+      "volumesFrom": [],
+      "ulimits": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/livesocial-backend-service-prod",
+          "awslogs-create-group": "true",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        },
+        "secretOptions": []
+      },
+      "systemControls": []
     }
   ],
-  "essential": true,
-  "environment": [],
-  "environmentFiles": [],
-  "mountPoints": [],
-  "volumesFrom": [],
-  "ulimits": [],
-  "logConfiguration": {
-    "logDriver": "awslogs",
-    "options": {
-      "awslogs-group": "/ecs/livesocial-backend-service-prod",
-      "awslogs-create-group": "true",
-      "awslogs-region": "ap-south-1",
-      "awslogs-stream-prefix": "ecs"
+  "family": "livesocial-backend-service-prod",
+  "taskRoleArn": "arn:aws:iam::602664593558:role/live-social-ecs-role",
+  "executionRoleArn": "arn:aws:iam::602664593558:role/live-social-ecs-role",
+  "networkMode": "awsvpc",
+  "revision": 2,
+  "volumes": [],
+  "status": "ACTIVE",
+  "requiresAttributes": [
+    {
+      "name": "com.amazonaws.ecs.capability.logging-driver.awslogs"
     },
-    "secretOptions": []
+    {
+      "name": "ecs.capability.execution-role-awslogs"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.ecr-auth"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.docker-remote-api.1.19"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.docker-remote-api.1.21"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.task-iam-role"
+    },
+    {
+      "name": "ecs.capability.execution-role-ecr-pull"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.docker-remote-api.1.18"
+    },
+    {
+      "name": "ecs.capability.task-eni"
+    },
+    {
+      "name": "com.amazonaws.ecs.capability.docker-remote-api.1.29"
+    }
+  ],
+  "placementConstraints": [],
+  "compatibilities": [
+    "EC2",
+    "FARGATE",
+    "MANAGED_INSTANCES"
+  ],
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "4096",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
   },
-  "systemControls": []
+  "registeredAt": "2026-03-22T22:04:33.216Z",
+  "registeredBy": "arn:aws:iam::602664593558:user/bhavik-devops",
+  "enableFaultInjection": false,
+  "tags": []
 }
