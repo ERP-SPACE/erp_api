@@ -122,7 +122,70 @@ const login = handleAsyncErrors(async (req, res) => {
   });
 });
 
+// Update logged-in user's profile (username, email, phone)
+const updateProfile = handleAsyncErrors(async (req, res) => {
+  const ALLOWED_FIELDS = ["username", "email", "phone"];
+  const updates = {};
+  for (const field of ALLOWED_FIELDS) {
+    if (req.body[field] !== undefined) {
+      updates[field] = req.body[field];
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    throw new AppError("No valid fields provided to update", 400);
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.userId,
+    { $set: updates },
+    { new: true, runValidators: true }
+  );
+
+  if (!user) {
+    throw new AppError("User not found", 404);
+  }
+
+  res.json({
+    success: true,
+    user: sanitizeUser(user),
+  });
+});
+
+// Change password for the logged-in user
+const changePassword = handleAsyncErrors(async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+
+  if (!currentPassword || !newPassword) {
+    throw new AppError("Current password and new password are required", 400);
+  }
+
+  if (newPassword.length < 8) {
+    throw new AppError("New password must be at least 8 characters long", 400);
+  }
+
+  const user = await User.findById(req.userId).select("+password");
+  if (!user) {
+    throw new AppError("User not found", 404);
+  }
+
+  const isCorrect = await user.correctPassword(currentPassword);
+  if (!isCorrect) {
+    throw new AppError("Current password is incorrect", 401);
+  }
+
+  user.password = newPassword;
+  await user.save();
+
+  res.json({
+    success: true,
+    message: "Password changed successfully",
+  });
+});
+
 module.exports = {
   register,
   login,
+  updateProfile,
+  changePassword,
 };
