@@ -18,10 +18,10 @@ dotenv.config();
 const seedData = async () => {
   try {
     // Connect to MongoDB
-    await mongoose.connect(
-      process.env.MONGODB_URI ||
-        "mongodb+srv://root:root@aimarketingcluster.irykf5p.mongodb.net/?retryWrites=true&w=majority&appName=AIMarketingCluster"
-    );
+    if (!process.env.MONGODB_URI) {
+      throw new Error("MONGODB_URI is not set");
+    }
+    await mongoose.connect(process.env.MONGODB_URI);
     console.log("Connected to MongoDB");
 
     // Drop problematic compound index if it exists
@@ -68,10 +68,20 @@ const seedData = async () => {
       if (existingAdmin) {
         console.log("Default admin user already exists:", existingAdmin.email);
       } else {
+        const shouldCreateSeedAdmin =
+          (process.env.CREATE_SEED_ADMIN || "").toLowerCase() === "true";
+        if (!shouldCreateSeedAdmin) {
+          console.log(
+            "Skipping seed admin creation (set CREATE_SEED_ADMIN=true to enable)"
+          );
+        } else if (!process.env.SEED_ADMIN_PASSWORD) {
+          throw new Error("SEED_ADMIN_PASSWORD is required when seeding admin");
+        }
+
         const adminUser = new User({
           username: "admin",
           email: "admin@gmail.com",
-          password: process.env.SEED_ADMIN_PASSWORD || "Admin@123",
+          password: process.env.SEED_ADMIN_PASSWORD,
           role: "SuperAdmin",
           address: {
             line1: "123 Main St",
@@ -84,8 +94,7 @@ const seedData = async () => {
         });
         await adminUser.save();
         console.log(
-          "Default admin user created: admin /",
-          process.env.SEED_ADMIN_PASSWORD ? "****(from env)****" : "Admin@123"
+          "Default admin user created: admin / ****(from env)****"
         );
       }
     } catch (error) {

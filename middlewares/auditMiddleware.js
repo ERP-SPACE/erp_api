@@ -1,5 +1,35 @@
 const AuditLog = require("../models/AuditLog");
 
+const SENSITIVE_KEYS = new Set([
+  "password",
+  "token",
+  "authorization",
+  "refreshToken",
+  "accessToken",
+  "jwt",
+  "secret",
+  "apiKey",
+  "otp",
+  "pin",
+]);
+
+const redactSensitive = (value, depth = 0) => {
+  if (depth > 6) return "[Truncated]";
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redactSensitive(v, depth + 1));
+
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (SENSITIVE_KEYS.has(String(k))) {
+      out[k] = "[REDACTED]";
+    } else {
+      out[k] = redactSensitive(v, depth + 1);
+    }
+  }
+  return out;
+};
+
 const auditMiddleware = async (req, res, next) => {
   // Store original send function
   const originalSend = res.send;
@@ -22,13 +52,13 @@ const auditMiddleware = async (req, res, next) => {
     ) {
       try {
         const auditEntry = {
-          userId: "super_admin",
+          userId: req.userId || "anonymous",
           action: getActionFromMethod(req.method),
           entity: getEntityFromPath(req.path),
           entityId: req.params.id || null,
           changes: {
-            before: req.body.before || null,
-            after: req.body,
+            before: req.body?.before ? redactSensitive(req.body.before) : null,
+            after: redactSensitive(req.body),
           },
           ipAddress: req.ip,
           timestamp: new Date(),

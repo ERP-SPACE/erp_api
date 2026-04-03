@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const AppError = require("../utils/AppError");
+const User = require("../models/User");
 
 const authenticate = async (req, res, next) => {
   try {
@@ -9,9 +10,26 @@ const authenticate = async (req, res, next) => {
       throw new AppError("Please authenticate", 401);
     }
 
+    if (!process.env.JWT_SECRET) {
+      throw new AppError("Server misconfigured: JWT secret missing", 500);
+    }
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = decoded.userId;
-    req.userRole = decoded.role;
+
+    const user = await User.findById(decoded.userId).select(
+      "role active passwordChangedAt"
+    );
+    if (!user || user.active === false) {
+      throw new AppError("Please authenticate", 401);
+    }
+
+    if (decoded.iat && user.changedPasswordAfter(decoded.iat)) {
+      throw new AppError("Please authenticate", 401);
+    }
+
+    req.userId = user._id.toString();
+    req.userRole = user.role;
+    req.user = user;
 
     next();
   } catch (error) {

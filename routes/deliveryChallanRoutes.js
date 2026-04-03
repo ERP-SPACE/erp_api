@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const { authenticate } = require("../middlewares/auth");
 const {
   getDeliveryChallans,
   getDeliveryChallan,
@@ -9,7 +10,7 @@ const {
 } = require("../controllers/deliveryChallanController");
 
 // All routes require authentication
-// TODO: Add authentication middleware
+router.use(authenticate);
 
 router
   .route("/")

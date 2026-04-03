@@ -2,9 +2,9 @@ const express = require("express");
 const router = express.Router();
 const qualityController = require("../controllers/qualityController");
 const { validateQuality } = require("../validators/qualityValidator");
-// const { authenticate, authorize } = require("../middleware/authMiddleware");
+const { authenticate } = require("../middlewares/auth");
 
-// router.use(authenticate);
+router.use(authenticate);
 
 router.get("/", qualityController.getAllQualities);
 router.get("/:id", qualityController.getQualityById);

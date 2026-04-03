@@ -1,11 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const rollController = require("../controllers/rollController");
-// const { authenticate, authorize } = require("../middlewares/auth");
+const { authenticate } = require("../middlewares/auth");
 
-// router.use(authenticate);
+router.use(authenticate);
 
-// Public routes
 router.get("/", rollController.getAllRolls);
 router.get("/summary", rollController.getInventorySummary);
 router.get("/unmapped", rollController.getUnmappedRolls);
@@ -14,9 +13,6 @@ router.get("/:id/history", rollController.getRollHistory);
 router.get("/:id", rollController.getRoll);
 router.post("/", rollController.createRolls);
 router.patch("/:id", rollController.updateRoll);
-
-// Warehouse staff routes
-// router.use(authorize(["admin", "warehouse_staff", "inventory_manager"]));
 
 router.post("/map", rollController.mapUnmappedRolls);
 router.post("/allocate", rollController.allocateRolls);

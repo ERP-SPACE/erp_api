@@ -1,9 +1,10 @@
 const express = require("express");
 const router = express.Router();
+const { authenticate } = require("../middlewares/auth");
 const { getPayments } = require("../controllers/paymentController");
 
 // All routes require authentication
-// TODO: Add authentication middleware
+router.use(authenticate);
 
 router.route("/")
   .get(getPayments);

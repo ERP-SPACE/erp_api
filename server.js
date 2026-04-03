@@ -5,8 +5,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const mongoSanitize = require("express-mongo-sanitize");
 const rateLimit = require("express-rate-limit");
-const path = require("path");
-const { fork } = require("child_process");
+const auditMiddleware = require("./middlewares/auditMiddleware");
 
 // Import routes
 const authRoutes = require("./routes/authRoutes");
@@ -31,17 +30,56 @@ const voucherRoutes = require("./routes/voucherRoutes");
 const reportRoutes = require("./routes/reportRoutes");
 const gsmRoutes = require("./routes/gsmRoutes");
 const qualityRoutes = require("./routes/qualityRoutes");
-const Roll = require("./models/Roll");
 
 // Import error handler
 const globalErrorHandler = require("./middlewares/errorMiddleware");
 
 const app = express();
 
+if (!process.env.JWT_SECRET) {
+  console.error(
+    "Startup error: JWT_SECRET is not set. Please define it in your environment or .env file."
+  );
+  process.exit(1);
+}
+
+if (!process.env.MONGODB_URI) {
+  console.error(
+    "Startup error: MONGODB_URI is not set. Please define it in your environment or .env file."
+  );
+  process.exit(1);
+}
+
+if (!process.env.JWT_EXPIRES_IN) {
+  // Safe default, but explicit is better
+  process.env.JWT_EXPIRES_IN = "7d";
+}
+
+if ((process.env.TRUST_PROXY || "").toLowerCase() === "true") {
+  app.set("trust proxy", 1);
+}
+
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 // CORS configuration
 const corsOptions = {
-  origin: true,
-  credentials: true,
+  origin: (origin, callback) => {
+    // Allow non-browser clients (curl/postman) without an Origin header
+    if (!origin) return callback(null, true);
+
+    // In dev, allow all if no allowlist is set
+    if (allowedOrigins.length === 0 && process.env.NODE_ENV !== "production") {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials:
+    (process.env.CORS_CREDENTIALS || "").toLowerCase() === "true" || false,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
@@ -59,15 +97,34 @@ app.options("*", cors(corsOptions));
 app.use(mongoSanitize());
 
 // Rate limiting
+const isProd = process.env.NODE_ENV === "production";
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  // Avoid breaking rapid UI fetches in development.
+  max: isProd ? 100 : 0,
+  // Only rate-limit write operations; allow normal list/detail fetching.
+  skip: (req) => !isProd || req.method === "GET" || req.method === "OPTIONS",
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-app.use("/api", limiter);
+app.use("/api/v1", limiter);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: isProd ? 20 : 0,
+  skip: (req) => !isProd || req.method === "OPTIONS",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/api/v1/auth", authLimiter);
 
 // Body parser
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// Audit logging (redacted)
+app.use(auditMiddleware);
 
 // API routes
 app.use("/api/v1/auth", authRoutes);
@@ -112,14 +169,6 @@ app.use((req, res) => {
 
 // Global error handler
 app.use(globalErrorHandler);
-
-// Database connection
-if (!process.env.MONGODB_URI) {
-  console.error(
-    "MongoDB connection error: MONGODB_URI is not set. Please define it in your environment or .env file."
-  );
-  process.exit(1);
-}
 
 mongoose
   .connect(process.env.MONGODB_URI, {

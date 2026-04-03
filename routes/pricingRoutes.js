@@ -1,16 +1,14 @@
 const express = require("express");
 const router = express.Router();
 const pricingController = require("../controllers/pricingController");
-// const { authenticate, authorize } = require("../middlewares/auth");
+const { authenticate } = require("../middlewares/auth");
 
-// router.use(authenticate);
+router.use(authenticate);
 
 router.post("/calculate", pricingController.calculatePrice);
 router.post("/override", pricingController.applyOverride);
 router.get("/matrix/:customerId", pricingController.getPriceMatrix);
 router.post("/deal-rate", pricingController.calculateDealRate);
-
-// router.use(authorize(["admin", "sales_manager"]));
 
 router.post("/bulk-revision", pricingController.bulkRevision);
 

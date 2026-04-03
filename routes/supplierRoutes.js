@@ -1,11 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const supplierController = require("../controllers/supplierController");
-// const { authenticate, authorize } = require("../middlewares/auth");
+const { authenticate } = require("../middlewares/auth");
 
-// router.use(authenticate);
+router.use(authenticate);
 
-// Public routes
 router.get("/", supplierController.getAllSuppliers);
 router.get("/next-code", supplierController.getNextSupplierCode);
 router.get("/:id", supplierController.getSupplierById);
@@ -25,9 +24,6 @@ router.post("/:id/contact-persons", supplierController.createSupplierContactPers
 router.patch("/:id/contact-persons/:contactPersonId", supplierController.updateSupplierContactPerson);
 router.delete("/:id/contact-persons/:contactPersonId", supplierController.deleteSupplierContactPerson);
 router.patch("/:id/contact-persons/:contactPersonId/set-primary", supplierController.setSupplierContactPersonPrimary);
-
-// Admin/Manager routes
-// router.use(authorize(["admin", "super_admin", "purchase_manager"]));
 
 router.post("/", supplierController.createSupplier);
 router.patch("/:id", supplierController.updateSupplier);

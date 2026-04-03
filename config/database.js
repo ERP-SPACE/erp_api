@@ -2,12 +2,10 @@ const mongoose = require("mongoose");
 
 const connectDB = async () => {
   try {
-    // Try MongoDB Atlas first, then fallback to local MongoDB
-    let connectionString = process.env.MONGODB_URI;
+    const connectionString = process.env.MONGODB_URI;
 
     if (!connectionString) {
-      // Default to local MongoDB if no environment variable is set
-      connectionString = "mongodb+srv://root:root@aimarketingcluster.irykf5p.mongodb.net/?retryWrites=true&w=majority&appName=AIMarketingCluster";
+      throw new Error("MONGODB_URI is not set");
     }
 
     const conn = await mongoose.connect(connectionString, {
