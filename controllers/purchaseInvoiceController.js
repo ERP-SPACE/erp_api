@@ -14,36 +14,41 @@ const toNumber = (value) => {
   return Number.isNaN(numeric) ? 0 : numeric;
 };
 
+// Normalise rollDetails to the canonical individual-roll format: [{ lengthMeters }].
+// Accepts BOTH the old grouped format { rollQty, metersPerRoll } (expands to N entries)
+// and the new per-roll format { lengthMeters } (passes through).  This ensures
+// backward-compatibility with any data stored before the schema change.
 const normalizeRollDetails = (rollDetails = []) => {
   if (!Array.isArray(rollDetails)) return [];
-  return rollDetails
-    .map((detail = {}) => ({
-      rollQty: Math.max(toNumber(detail.rollQty), 0),
-      metersPerRoll: Math.max(toNumber(detail.metersPerRoll), 0),
-    }))
-    .filter((detail) => detail.rollQty > 0 && detail.metersPerRoll > 0);
+  const expanded = [];
+  for (const detail of rollDetails) {
+    if (!detail) continue;
+    if (detail.lengthMeters !== undefined) {
+      // New per-roll format — pass through
+      const len = toNumber(detail.lengthMeters);
+      if (len > 0) expanded.push({ lengthMeters: len });
+    } else if (
+      detail.rollQty !== undefined ||
+      detail.metersPerRoll !== undefined
+    ) {
+      // Old grouped format — expand each group to individual roll entries
+      const qty = Math.max(Math.round(toNumber(detail.rollQty)), 0);
+      const mpr = toNumber(detail.metersPerRoll);
+      if (qty > 0 && mpr > 0) {
+        for (let i = 0; i < qty; i++) expanded.push({ lengthMeters: mpr });
+      }
+    }
+  }
+  return expanded;
 };
 
+// Aggregate stats derived from an individual-roll array.
 const summarizeRollDetails = (rollDetails = []) => {
   const normalized = normalizeRollDetails(rollDetails);
-  const totals = normalized.reduce(
-    (acc, detail) => {
-      acc.totalRolls += detail.rollQty;
-      acc.totalMeters += detail.rollQty * detail.metersPerRoll;
-      return acc;
-    },
-    { totalRolls: 0, totalMeters: 0 }
-  );
-
-  const avgMetersPerRoll =
-    totals.totalRolls > 0 ? totals.totalMeters / totals.totalRolls : 0;
-
-  return {
-    normalized,
-    totalRolls: totals.totalRolls,
-    totalMeters: totals.totalMeters,
-    avgMetersPerRoll,
-  };
+  const totalRolls = normalized.length;
+  const totalMeters = normalized.reduce((s, r) => s + r.lengthMeters, 0);
+  const avgMetersPerRoll = totalRolls > 0 ? totalMeters / totalRolls : 0;
+  return { normalized, totalRolls, totalMeters, avgMetersPerRoll };
 };
 
 const deriveRollMetrics = (line = {}) => {
@@ -62,6 +67,7 @@ const deriveRollMetrics = (line = {}) => {
       ? toNumber(line.totalMeters || line.inwardMeters) / rollCount
       : 0);
 
+  // totalMeters is always driven by individual roll lengths when available
   const totalMeters =
     summary.totalMeters ||
     toNumber(line.inwardMeters) ||
@@ -250,7 +256,12 @@ const createPurchaseInvoice = handleAsyncErrors(async (req, res) => {
       );
     }
 
-    if (rollInfo.rollCount > remainingOrdered) {
+    // Only enforce rollCount limit when qtyRolls was NOT explicitly provided.
+    // When qtyRolls is explicitly set it is the authoritative invoiced quantity
+    // (already validated above). rollDetails are supplementary physical records
+    // and their sum may legitimately differ from the invoiced quantity
+    // (e.g. supplier delivers 55 rolls but only 50 were ordered/invoiced).
+    if (!toNumber(line.qtyRolls) && rollInfo.rollCount > remainingOrdered) {
       throw new AppError(
         `Roll quantity ${rollInfo.rollCount} exceeds remaining ordered quantity ${remainingOrdered} for the purchase order line`,
         400,
@@ -263,18 +274,26 @@ const createPurchaseInvoice = handleAsyncErrors(async (req, res) => {
     const lengthMetersPerRoll =
       rollInfo.lengthPerRoll ||
       toNumber(poLine.lengthMetersPerRoll);
-    const inwardRolls = rollInfo.rollCount || qty;
-    const inwardMeters =
-      rollInfo.totalMeters ||
-      toNumber(line.inwardMeters) ||
-      inwardRolls * (lengthMetersPerRoll || 0) ||
-      0;
-    const totalMeters =
-      rollInfo.totalMeters ||
-      toNumber(line.totalMeters) ||
-      qty * (lengthMetersPerRoll || 0);
 
-    const lineBaseTotal = totalMeters * rate; // price on meters
+    // Auto-generate per-roll entries when the caller only provides qty + meterPerRoll.
+    // rollDetails is the source of truth; generate only when nothing was provided.
+    let resolvedRollDetails = rollInfo.rollDetails;
+    if (!resolvedRollDetails.length && qty > 0 && lengthMetersPerRoll > 0) {
+      resolvedRollDetails = Array.from({ length: qty }, () => ({
+        lengthMeters: lengthMetersPerRoll,
+      }));
+    }
+
+    // totalMeters = SUM(rollDetails.lengthMeters) — not qty × meterPerRoll
+    const totalMeters =
+      resolvedRollDetails.length > 0
+        ? resolvedRollDetails.reduce((s, r) => s + r.lengthMeters, 0)
+        : toNumber(line.totalMeters) || qty * (lengthMetersPerRoll || 0);
+
+    const inwardRolls = resolvedRollDetails.length || rollInfo.rollCount || qty;
+    const inwardMeters = totalMeters;
+
+    const lineBaseTotal = totalMeters * rate; // price per meter × total meters
     const lineTax = lineBaseTotal * (taxRate / 100);
 
     subtotal += lineBaseTotal;
@@ -298,8 +317,8 @@ const createPurchaseInvoice = handleAsyncErrors(async (req, res) => {
       totalMeters,
       inwardRolls,
       inwardMeters,
-      rollDetails: rollInfo.rollDetails,
-      lineTotal: lineBaseTotal, // keep per-line amount tax-exclusive; GST handled at invoice level
+      rollDetails: resolvedRollDetails,
+      lineTotal: lineBaseTotal, // tax-exclusive; GST handled at invoice level
     };
   });
 
@@ -451,41 +470,39 @@ const postPurchaseInvoice = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Create rolls for a purchase invoice and update stock
+// Create Roll documents when a PI is posted.
+// Each entry in line.rollDetails maps 1-to-1 to one physical roll in inventory.
+// If rollDetails is empty, rolls are auto-generated from qtyRolls × lengthMetersPerRoll.
 const createRollsForPurchaseInvoice = async (purchaseInvoice) => {
-  // Avoid duplicate roll creation if already processed for this PI
-  const existingBatch = await Batch.findOne({
+  // Idempotency guard — skip if rolls already exist for this PI
+  const existingRollCount = await Roll.countDocuments({
     purchaseInvoiceId: purchaseInvoice._id,
   });
-  const existingRollsCount = existingBatch
-    ? await Roll.countDocuments({ batchId: existingBatch._id })
-    : 0;
-  if (existingBatch && existingRollsCount > 0) return;
+  if (existingRollCount > 0) return;
 
   const supplier = await Supplier.findById(purchaseInvoice.supplierId);
   if (!supplier) {
     throw new AppError("Supplier not found for purchase invoice", 404);
   }
 
+  // Reuse existing batch or create a new one linked to this PI
+  const existingBatch = await Batch.findOne({
+    purchaseInvoiceId: purchaseInvoice._id,
+  });
+
   const batch =
     existingBatch ||
-    (
-      await Batch.create({
-        supplierId: supplier._id,
-        purchaseInvoiceId: purchaseInvoice._id,
-        batchCode: numberingService.generateBatchCode(),
-      })
-    );
+    (await Batch.create({
+      supplierId: supplier._id,
+      purchaseInvoiceId: purchaseInvoice._id,
+      batchCode: numberingService.generateBatchCode(),
+    }));
 
+  // Overhead cost per meter — spread landed costs evenly across all inward meters
   const totalMetersAcrossLines = (purchaseInvoice.lines || []).reduce(
-    (sum, line) => {
-      const { totalMeters } = deriveRollMetrics(line);
-      const lineMeters = totalMeters || 0;
-      return sum + (Number(lineMeters) || 0);
-    },
+    (sum, line) => sum + (Number(deriveRollMetrics(line).totalMeters) || 0),
     0
   );
-
   const overheadPerMeter =
     totalMetersAcrossLines > 0
       ? (purchaseInvoice.totalLandedCost || 0) / totalMetersAcrossLines
@@ -497,43 +514,33 @@ const createRollsForPurchaseInvoice = async (purchaseInvoice) => {
     const { rollCount, lengthPerRoll, rollDetails } = deriveRollMetrics(line);
     const width = Number(line.widthInches || line.width || 0);
 
-    if (!rollCount || ![24, 36, 44, 63].includes(width)) {
-      continue;
-    }
+    if (!rollCount || ![24, 36, 44, 63].includes(width)) continue;
 
     const rate = Number(line.ratePerRoll) || 0;
 
-    const rollEntries = [];
-    if (rollDetails && rollDetails.length) {
-      rollDetails.forEach((detail) => {
-        for (let i = 0; i < detail.rollQty; i++) {
-          rollEntries.push(detail.metersPerRoll);
-        }
-      });
-    } else {
-      for (let i = 0; i < rollCount; i++) {
-        rollEntries.push(lengthPerRoll || 0);
-      }
-    }
+    // Build the per-roll length list.
+    // rollDetails is [{ lengthMeters }] after normalisation; fall back to uniform
+    // lengths when rollDetails is still empty (e.g. very old records or manual lines).
+    const rollLengths =
+      rollDetails.length > 0
+        ? rollDetails.map((d) => toNumber(d.lengthMeters))
+        : Array.from({ length: rollCount }, () => lengthPerRoll || 0);
 
-    for (const rollLength of rollEntries) {
+    for (const rollLength of rollLengths) {
       const normalizedLength = Number(rollLength) || 0;
       if (!normalizedLength) continue;
 
       const seq = preparedRolls.length + 1;
-      const rollNumber = `${purchaseInvoice.piNumber}-R${String(seq).padStart(
-        4,
-        "0"
-      )}`;
+      const rollNumber = `${purchaseInvoice.piNumber}-R${String(seq).padStart(4, "0")}`;
 
-      const baseCostPerMeter =
-        normalizedLength > 0 ? rate / normalizedLength : 0;
+      const baseCostPerMeter = normalizedLength > 0 ? rate / normalizedLength : 0;
       const landedCostPerMeter = baseCostPerMeter + overheadPerMeter;
 
       preparedRolls.push({
         rollNumber,
         supplierId: supplier._id,
         batchId: batch._id,
+        purchaseInvoiceId: purchaseInvoice._id,
         skuId: line.skuId || null,
         skuCode: line.skuCode,
         categoryName: line.categoryName,
@@ -545,8 +552,7 @@ const createRollsForPurchaseInvoice = async (purchaseInvoice) => {
         status: line.skuId ? "Mapped" : "Unmapped",
         baseCostPerMeter,
         landedCostPerMeter,
-        totalLandedCost:
-          Math.round(landedCostPerMeter * normalizedLength * 100) / 100,
+        totalLandedCost: Math.round(landedCostPerMeter * normalizedLength * 100) / 100,
         poLineId: line.poLineId,
       });
     }
@@ -554,17 +560,11 @@ const createRollsForPurchaseInvoice = async (purchaseInvoice) => {
 
   if (!preparedRolls.length) return;
 
-  // If rolls already exist for this batch, skip creation (idempotent)
-  const rollExists = existingBatch
-    ? await Roll.exists({ batchId: existingBatch._id })
-    : null;
-  if (rollExists) return;
-
   await Roll.insertMany(preparedRolls);
 
-  // Refresh batch roll count
-  const rollCount = await Roll.countDocuments({ batchId: batch._id });
-  batch.totalRolls = rollCount;
+  // Keep batch roll count in sync
+  const finalRollCount = await Roll.countDocuments({ batchId: batch._id });
+  batch.totalRolls = finalRollCount;
   await batch.save();
 };
 

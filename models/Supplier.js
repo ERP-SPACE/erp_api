@@ -1,5 +1,13 @@
 const mongoose = require("mongoose");
 
+const supplierSkuRateSchema = new mongoose.Schema(
+  {
+    skuId: { type: mongoose.Schema.Types.ObjectId, ref: "SKU", required: true },
+    baseRate: { type: Number, required: true, min: 0 },
+  },
+  { _id: false }
+);
+
 const supplierSchema = new mongoose.Schema(
   {
     supplierCode: {
@@ -52,6 +60,10 @@ const supplierSchema = new mongoose.Schema(
       required: true,
     },
     pincode: { type: String, required: true },
+    skuRates: {
+      type: [supplierSkuRateSchema],
+      default: [],
+    },
     active: {
       type: Boolean,
       default: true,
@@ -68,7 +80,7 @@ const supplierSchema = new mongoose.Schema(
 supplierSchema.index({ supplierCode: 1 });
 supplierSchema.index({ gstin: 1 });
 supplierSchema.index({ active: 1 });
-supplierSchema.index({ "categoryRates.categoryId": 1 });
+supplierSchema.index({ "skuRates.skuId": 1 });
 
 // Generate supplier code
 supplierSchema.pre("save", async function (next) {

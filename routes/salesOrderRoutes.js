@@ -11,6 +11,7 @@ const {
   holdSalesOrder,
   closeSalesOrder,
   calculatePricing,
+  previewAllocation,
 } = require("../controllers/salesOrderController");
 
 // All routes require authentication
@@ -29,5 +30,6 @@ router.post("/:id/cancel", cancelSalesOrder);
 router.post("/:id/hold", holdSalesOrder);
 router.post("/:id/close", closeSalesOrder);
 router.post("/calculate-pricing", calculatePricing);
+router.post("/preview-allocation", previewAllocation);
 
 module.exports = router;

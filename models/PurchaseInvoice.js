@@ -97,10 +97,14 @@ const purchaseInvoiceSchema = new mongoose.Schema(
         lineTotal: Number,
         inwardRolls: Number,
         inwardMeters: Number,
+        // One entry per physical roll received; source of truth for inventory.
+        // Auto-generated from qtyRolls × lengthMetersPerRoll when not provided.
         rollDetails: [
           {
-            rollQty: Number,
-            metersPerRoll: Number,
+            lengthMeters: {
+              type: Number,
+              min: 0,
+            },
           },
         ],
       },

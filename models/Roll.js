@@ -82,6 +82,11 @@ const rollSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "PurchaseOrderLine",
     },
+    purchaseInvoiceId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PurchaseInvoice",
+      default: null,
+    },
     // For allocated/dispatched rolls
     allocationDetails: {
       soLineId: {
@@ -151,6 +156,7 @@ rollSchema.index(
 );
 rollSchema.index({ status: 1, inwardedAt: 1 }); // For unmapped aging
 rollSchema.index({ "allocationDetails.soLineId": 1 });
+rollSchema.index({ purchaseInvoiceId: 1 });
 
 // Virtual for age in days
 rollSchema.virtual("ageInDays").get(function () {

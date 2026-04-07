@@ -3,8 +3,73 @@ const Customer = require("../models/Customer");
 const SKU = require("../models/SKU");
 const numberingService = require("../services/numberingService");
 const pricingService = require("../services/pricingService");
+const { autoAllocateForLine } = require("../services/allocationService");
 const { STATUS } = require("../config/constants");
 const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
+
+// ─── Shared line builder ────────────────────────────────────────────────────
+
+/**
+ * Build a fully-processed line object for storage.
+ * Runs the allocation algorithm against live inventory and attaches the result.
+ *
+ * @param {Object}  line    - Raw line from request body
+ * @param {Object}  sku     - Mongoose SKU document
+ * @param {number}  lineTotal
+ * @param {boolean} [runAllocation=true] - Set false in calculatePricing (dry run)
+ */
+async function buildProcessedLine(line, sku, lineTotal, runAllocation = true) {
+  const effectiveTotalMeters =
+    line.totalMeters != null && line.totalMeters > 0
+      ? Number(line.totalMeters)
+      : Number(line.qtyRolls) * Number(line.lengthMetersPerRoll);
+
+  // ── Auto-allocation against live inventory ─────────────────────────────
+  // Only runs when explicitly enabled and the line has a total-meters target.
+  // If the user already provided manual bifurcations, we still compute allocation
+  // so the SO carries a faithful inventory snapshot, but bifurcations take precedence
+  // for dispatch planning.
+  let allocationData = {
+    allocation: [],
+    allocationStatus: "NOT_CHECKED",
+    totalAllocatedMeters: 0,
+    remainingMeters: effectiveTotalMeters,
+  };
+
+  if (runAllocation && effectiveTotalMeters > 0 && line.skuId) {
+    try {
+      const result = await autoAllocateForLine(line.skuId, effectiveTotalMeters);
+      if (result) {
+        allocationData = {
+          allocation: result.rollDetails,
+          allocationStatus: result.status,
+          totalAllocatedMeters: result.totalAllocatedMeters,
+          remainingMeters: result.remainingMeters,
+        };
+      }
+    } catch (err) {
+      // Allocation failure must never block order save
+      console.error(`[allocation] Failed for SKU ${line.skuId}:`, err.message);
+    }
+  }
+
+  return {
+    skuId: line.skuId,
+    categoryName: sku.categoryName,
+    gsm: sku.gsm,
+    qualityName: sku.qualityName,
+    widthInches: sku.widthInches,
+    lengthMetersPerRoll: line.lengthMetersPerRoll,
+    qtyRolls: line.qtyRolls,
+    totalMeters: effectiveTotalMeters,
+    bifurcations: Array.isArray(line.bifurcations) ? line.bifurcations : [],
+    ...allocationData,
+    overrideRatePerRoll: line.overrideRatePerRoll,
+    lineTotal,
+  };
+}
+
+// ─── Controllers ────────────────────────────────────────────────────────────
 
 // Get all sales orders
 const getSalesOrders = handleAsyncErrors(async (req, res) => {
@@ -41,7 +106,7 @@ const getSalesOrders = handleAsyncErrors(async (req, res) => {
         path: "productId",
         populate: [
           { path: "categoryId", select: "name" },
-          { path: "gsmId", select: "value label" },
+          { path: "gsmId", select: "name value" },
           { path: "qualityId", select: "name" },
         ],
       },
@@ -70,7 +135,7 @@ const getSalesOrder = handleAsyncErrors(async (req, res) => {
         path: "productId",
         populate: [
           { path: "categoryId", select: "name" },
-          { path: "gsmId", select: "value label" },
+          { path: "gsmId", select: "name value" },
           { path: "qualityId", select: "name" },
         ],
       },
@@ -88,7 +153,7 @@ const getSalesOrder = handleAsyncErrors(async (req, res) => {
 
 // Create sales order with pricing calculation
 const createSalesOrder = handleAsyncErrors(async (req, res) => {
-  const { customerId, lines, notes, discountPercent = 0, date } = req.body;
+  const { customerId, lines, notes, discountPercent = 0, date, dueDays } = req.body;
 
   // Verify customer exists and is not blocked
   const customer = await Customer.findById(customerId);
@@ -130,18 +195,7 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
     subtotal += lineTotal;
     taxAmount += lineTax;
 
-    processedLines.push({
-      skuId: line.skuId,
-      categoryName: sku.categoryName,
-      gsm: sku.gsm,
-      qualityName: sku.qualityName,
-      widthInches: sku.widthInches,
-      lengthMetersPerRoll: line.lengthMetersPerRoll,
-      qtyRolls: line.qtyRolls,
-      totalMeters: line.qtyRolls * line.lengthMetersPerRoll,
-      overrideRatePerRoll: line.overrideRatePerRoll,
-      lineTotal: lineTotal + lineTax,
-    });
+    processedLines.push(await buildProcessedLine(line, sku, lineTotal + lineTax));
   }
 
   // Populate customerGroupId if it exists
@@ -151,6 +205,10 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
   );
 
   const discountAmount = (subtotal * (Number(discountPercent) || 0)) / 100;
+
+  const defaultDueDays =
+    (customer.creditPolicy?.creditDays || 0) +
+    (customer.creditPolicy?.graceDays || 0);
 
   const salesOrder = await SalesOrder.create({
     soNumber,
@@ -167,6 +225,7 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
     discountAmount,
     taxAmount,
     total: subtotal - discountAmount + taxAmount,
+    dueDays: dueDays != null ? Number(dueDays) : defaultDueDays,
     creditCheckPassed: false, // Will be updated on confirmation
     notes,
     createdBy: req.user ? req.user._id : undefined,
@@ -188,7 +247,7 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
 
 // Update sales order (draft only)
 const updateSalesOrder = handleAsyncErrors(async (req, res) => {
-  const { customerId, lines = [], notes, discountPercent = 0, date } =
+  const { customerId, lines = [], notes, discountPercent = 0, date, dueDays } =
     req.body;
   const salesOrder = await SalesOrder.findById(req.params.id);
 
@@ -233,21 +292,14 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
     subtotal += lineTotal;
     taxAmount += lineTax;
 
-    processedLines.push({
-      skuId: line.skuId,
-      categoryName: sku.categoryName,
-      gsm: sku.gsm,
-      qualityName: sku.qualityName,
-      widthInches: sku.widthInches,
-      lengthMetersPerRoll: line.lengthMetersPerRoll,
-      qtyRolls: line.qtyRolls,
-      totalMeters: line.qtyRolls * line.lengthMetersPerRoll,
-      overrideRatePerRoll: line.overrideRatePerRoll,
-      lineTotal: lineTotal + lineTax,
-    });
+    processedLines.push(await buildProcessedLine(line, sku, lineTotal + lineTax));
   }
 
   const discountAmount = (subtotal * (Number(discountPercent) || 0)) / 100;
+
+  const defaultDueDays =
+    (customer.creditPolicy?.creditDays || 0) +
+    (customer.creditPolicy?.graceDays || 0);
 
   salesOrder.customerId = customerId;
   salesOrder.customerName = customer.companyName;
@@ -258,6 +310,7 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
   salesOrder.discountAmount = discountAmount;
   salesOrder.taxAmount = taxAmount;
   salesOrder.total = subtotal - discountAmount + taxAmount;
+  salesOrder.dueDays = dueDays != null ? Number(dueDays) : (salesOrder.dueDays ?? defaultDueDays);
   salesOrder.notes = notes;
   salesOrder.creditCheckNotes = req.body.creditCheckNotes;
   salesOrder.creditCheckPassed =
@@ -278,7 +331,7 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
         path: "productId",
         populate: [
           { path: "categoryId", select: "name" },
-          { path: "gsmId", select: "value label" },
+          { path: "gsmId", select: "name value" },
           { path: "qualityId", select: "name" },
         ],
       },
@@ -399,18 +452,9 @@ const calculatePricing = handleAsyncErrors(async (req, res) => {
       line.overrideRatePerRoll
     );
 
-    processedLines.push({
-      skuId: line.skuId,
-      categoryName: sku.categoryName,
-      gsm: sku.gsm,
-      qualityName: sku.qualityName,
-      widthInches: sku.widthInches,
-      lengthMetersPerRoll: line.lengthMetersPerRoll,
-      qtyRolls: line.qtyRolls,
-      totalMeters: line.qtyRolls * line.lengthMetersPerRoll,
-      overrideRatePerRoll: line.overrideRatePerRoll,
-      requiresApproval: pricing.requiresApproval,
-    });
+    // calculatePricing is a dry-run — skip inventory allocation
+    const processedLine = await buildProcessedLine(line, sku, pricing.lineTotal, false);
+    processedLines.push({ ...processedLine, requiresApproval: pricing.requiresApproval });
   }
 
   res.json({
@@ -420,6 +464,45 @@ const calculatePricing = handleAsyncErrors(async (req, res) => {
       lines: processedLines,
     },
   });
+});
+
+/**
+ * Preview allocation for one or more lines WITHOUT saving anything.
+ *
+ * POST /sales-orders/preview-allocation
+ * Body: { lines: [{ skuId, totalMeters }] }
+ *
+ * Useful for the frontend bifurcation dialog — the UI can call this endpoint
+ * when the user opens the bifurcation modal to get an inventory-based suggestion.
+ */
+const previewAllocation = handleAsyncErrors(async (req, res) => {
+  const { lines } = req.body;
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    throw new AppError("lines array is required", 400, "VALIDATION_ERROR");
+  }
+
+  const results = await Promise.all(
+    lines.map(async (line) => {
+      if (!line.skuId || !line.totalMeters) {
+        return {
+          skuId: line.skuId,
+          totalMeters: line.totalMeters,
+          error: "skuId and totalMeters are required",
+        };
+      }
+
+      const result = await autoAllocateForLine(line.skuId, Number(line.totalMeters));
+
+      return {
+        skuId: line.skuId,
+        totalMeters: Number(line.totalMeters),
+        ...result,
+      };
+    })
+  );
+
+  res.json({ success: true, data: results });
 });
 
 module.exports = {
@@ -432,4 +515,5 @@ module.exports = {
   holdSalesOrder,
   closeSalesOrder,
   calculatePricing,
+  previewAllocation,
 };

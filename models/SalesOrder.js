@@ -1,6 +1,24 @@
 const mongoose = require("mongoose");
 const { STATUS } = require("../config/constants");
 
+const bifurcationGroupSchema = new mongoose.Schema(
+  {
+    qty: { type: Number, required: true },
+    lengthMeters: { type: Number, required: true },
+  },
+  { _id: false }
+);
+
+// Per-roll detail produced by the allocation algorithm
+const allocationRollSchema = new mongoose.Schema(
+  {
+    rollId: { type: mongoose.Schema.Types.ObjectId, ref: "Roll" },
+    rollNumber: String,
+    lengthMeters: Number,
+  },
+  { _id: false }
+);
+
 const salesOrderLineSchema = new mongoose.Schema({
   skuId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -14,6 +32,18 @@ const salesOrderLineSchema = new mongoose.Schema({
   lengthMetersPerRoll: Number,
   qtyRolls: Number,
   totalMeters: Number,
+  // Manual bifurcation set by the user via the UI (qty × length groups)
+  bifurcations: { type: [bifurcationGroupSchema], default: [] },
+  // Advisory allocation computed from live inventory at order save time.
+  // Does NOT lock rolls — physical locking happens at dispatch.
+  allocation: { type: [allocationRollSchema], default: [] },
+  allocationStatus: {
+    type: String,
+    enum: ["NOT_CHECKED", "FULFILLED", "PARTIAL", "NO_INVENTORY"],
+    default: "NOT_CHECKED",
+  },
+  totalAllocatedMeters: { type: Number, default: 0 },
+  remainingMeters: { type: Number, default: 0 },
   derivedRatePerRoll: Number,
   overrideRatePerRoll: Number,
   finalRatePerRoll: Number,
@@ -75,6 +105,10 @@ const salesOrderSchema = new mongoose.Schema(
     },
     taxAmount: Number,
     total: Number,
+    dueDays: {
+      type: Number,
+      default: null,
+    },
     creditCheckPassed: Boolean,
     creditCheckNotes: String,
     overrideApprovals: [

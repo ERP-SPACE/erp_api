@@ -2,7 +2,7 @@ const mongoose = require("mongoose");
 const Customer = require("../models/Customer");
 const SalesInvoice = require("../models/SalesInvoice");
 const SalesOrder = require("../models/SalesOrder");
-const RateHistory = require("../models/RateHistory");
+const CustomerRate = require("../models/CustomerRate");
 const Agent = require("../models/Agent");
 const numberingService = require("../services/numberingService");
 const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
@@ -358,26 +358,6 @@ const updateCustomer = handleAsyncErrors(async (req, res) => {
     customer.agentId
   );
 
-  // Record rate history when baseRate44 changes
-  if (
-    updateData.baseRate44 !== undefined &&
-    previousBaseRate44 !== undefined &&
-    updateData.baseRate44 !== previousBaseRate44
-  ) {
-    try {
-      await RateHistory.create({
-        customerId: customer._id,
-        effectiveRate44: previousBaseRate44,
-        appliedWidth: 44,
-        isOverride: false,
-        dealNotes: "Previous base rate before update",
-      });
-    } catch (err) {
-      // Log but do not block update
-      console.error("Failed to record rate history", err);
-    }
-  }
-
   res.json({
     success: true,
     data: customer,
@@ -505,29 +485,95 @@ const deleteCustomer = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Get rate history for customer
-const getRateHistory = handleAsyncErrors(async (req, res) => {
-  const { id } = req.params;
-  const { productId, limit } = req.query;
+// Get all active per-SKU rates for a customer
+const getCustomerRates = handleAsyncErrors(async (req, res) => {
+  const rates = await CustomerRate.find({
+    customerId: req.params.id,
+    active: true,
+    validTo: null,
+  })
+    .populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
+      populate: { path: "productId", select: "productCode productAlias" } })
+    .sort({ createdAt: -1 });
 
-  const query = { customerId: id };
-  if (productId) {
-    query.productId = productId;
+  res.json({ success: true, count: rates.length, data: rates });
+});
+
+// Set (create or replace) a SKU rate for a customer
+const setCustomerRate = handleAsyncErrors(async (req, res) => {
+  const { id } = req.params;
+  const { skuId, baseRate, notes, isSpecialRate, specialRateReason } = req.body;
+
+  if (!skuId)
+    throw new AppError("SKU is required", 400, "VALIDATION_ERROR");
+  if (baseRate === undefined || baseRate === null)
+    throw new AppError("Rate is required", 400, "VALIDATION_ERROR");
+
+  const numericRate = sanitizeNumericValue(baseRate);
+  if (numericRate < 0)
+    throw new AppError("Rate must be non-negative", 400, "VALIDATION_ERROR");
+
+  // Expire any currently active rate for this customer+SKU
+  await CustomerRate.updateMany(
+    { customerId: id, skuId, active: true, validTo: null },
+    { $set: { active: false, validTo: new Date() } }
+  );
+
+  const rate = await CustomerRate.create({
+    customerId: id,
+    skuId,
+    baseRate: numericRate,
+    validFrom: new Date(),
+    validTo: null,
+    active: true,
+    notes: notes || "",
+    isSpecialRate: isSpecialRate || false,
+    specialRateReason: isSpecialRate ? specialRateReason : undefined,
+    approvedBy: req.user?._id,
+  });
+
+  await rate.populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
+    populate: { path: "productId", select: "productCode productAlias" } });
+
+  res.status(201).json({ success: true, data: rate });
+});
+
+// Deactivate a SKU rate for a customer
+const deleteCustomerRate = handleAsyncErrors(async (req, res) => {
+  const { id, skuId } = req.params;
+
+  const result = await CustomerRate.updateMany(
+    { customerId: id, skuId, active: true, validTo: null },
+    { $set: { active: false, validTo: new Date() } }
+  );
+
+  if (result.modifiedCount === 0) {
+    throw new AppError(
+      "No active rate found for this SKU",
+      404,
+      "RESOURCE_NOT_FOUND"
+    );
   }
 
-  const rateHistory = await RateHistory.find(query)
-    .populate("productId", "name productCode")
-    .populate("soId", "soNumber")
-    .populate("siId", "siNumber")
-    .populate("overriddenBy", "name")
+  res.json({ success: true, message: "SKU rate removed successfully" });
+});
+
+// Get full rate history for a customer (optionally filtered by SKU)
+const getRateHistory = handleAsyncErrors(async (req, res) => {
+  const { id } = req.params;
+  const { skuId, limit } = req.query;
+
+  const query = { customerId: id };
+  if (skuId) query.skuId = skuId;
+
+  const history = await CustomerRate.find(query)
+    .populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
+      populate: { path: "productId", select: "productCode productAlias" } })
+    .populate("approvedBy", "name")
     .sort({ createdAt: -1 })
     .limit(parseInt(limit) || 50);
 
-  res.json({
-    success: true,
-    count: rateHistory.length,
-    data: rateHistory,
-  });
+  res.json({ success: true, count: history.length, data: history });
 });
 
 module.exports = {
@@ -539,5 +585,8 @@ module.exports = {
   blockCustomer,
   unblockCustomer,
   deleteCustomer,
+  getCustomerRates,
+  setCustomerRate,
+  deleteCustomerRate,
   getRateHistory,
 };

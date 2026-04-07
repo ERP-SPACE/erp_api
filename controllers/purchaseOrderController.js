@@ -231,13 +231,17 @@ const createPurchaseOrder = handleAsyncErrors(async (req, res) => {
         : typeof line.status === "string" && line.status.trim()
         ? line.status
         : "Pending";
-    const { taxRate: _ignoredTaxRate, ...restLine } = line || {};
+    // Extract skuId separately — an empty string must be omitted, not passed to
+    // Mongoose, which would throw a CastError trying to coerce "" to ObjectId.
+    const { taxRate: _ignoredTaxRate, skuId: rawSkuId, ...restLine } = line || {};
+    const skuId = rawSkuId || undefined;
 
     subtotal += lineTotal;
     totalMetersSum += lineMeters;
 
     return {
       ...restLine,
+      ...(skuId ? { skuId } : {}),
       qtyRolls,
       ratePerRoll,
       lengthMetersPerRoll,
@@ -327,19 +331,21 @@ const updatePurchaseOrder = handleAsyncErrors(async (req, res) => {
       const lengthMetersPerRoll = sanitizeNumber(line.lengthMetersPerRoll);
       const lineMeters = qtyRolls * lengthMetersPerRoll;
       const lineTotal = lineMeters * ratePerRoll;
-    const lineStatus =
-      typeof line.lineStatus === "string" && line.lineStatus.trim()
-        ? line.lineStatus
-        : typeof line.status === "string" && line.status.trim()
-        ? line.status
-        : "Pending";
-      const { taxRate: _ignoredTaxRate, ...restLine } = line || {};
+      const lineStatus =
+        typeof line.lineStatus === "string" && line.lineStatus.trim()
+          ? line.lineStatus
+          : typeof line.status === "string" && line.status.trim()
+          ? line.status
+          : "Pending";
+      const { taxRate: _ignoredTaxRate, skuId: rawSkuId, ...restLine } = line || {};
+      const skuId = rawSkuId || undefined;
 
       subtotal += lineTotal;
       totalMetersSum += lineMeters;
 
       return {
         ...restLine,
+        ...(skuId ? { skuId } : {}),
         qtyRolls,
         ratePerRoll,
         lengthMetersPerRoll,

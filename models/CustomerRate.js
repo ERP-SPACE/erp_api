@@ -7,13 +7,13 @@ const customerRateSchema = new mongoose.Schema(
       ref: "Customer",
       required: true,
     },
-    productId: {
+    // SKU-specific rate — width is baked in, no per-width derivation needed
+    skuId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "Product",
+      ref: "SKU",
       required: true,
     },
-    // All rates are stored as 44" benchmark
-    baseRate44: {
+    baseRate: {
       type: Number,
       required: true,
       min: 0,
@@ -48,28 +48,17 @@ const customerRateSchema = new mongoose.Schema(
 );
 
 // Indexes
-customerRateSchema.index({
-  customerId: 1,
-  productId: 1,
-  active: 1,
-  validFrom: -1,
-});
+customerRateSchema.index({ customerId: 1, skuId: 1, active: 1, validFrom: -1 });
 customerRateSchema.index({ customerId: 1, active: 1 });
-
-// Methods
-customerRateSchema.methods.calculateRateForWidth = function (widthInches) {
-  const calculatedRate = this.baseRate44 * (widthInches / 44);
-  return Math.round(calculatedRate);
-};
 
 customerRateSchema.statics.getActiveRate = async function (
   customerId,
-  productId,
+  skuId,
   date = new Date()
 ) {
   return this.findOne({
     customerId,
-    productId,
+    skuId,
     active: true,
     validFrom: { $lte: date },
     $or: [{ validTo: null }, { validTo: { $gte: date } }],
