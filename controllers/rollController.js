@@ -251,7 +251,9 @@ class RollController {
   });
 
   getInventorySummary = catchAsync(async (req, res) => {
-    const summary = await rollService.getInventorySummary();
+    // Accept an optional status filter (e.g. ?status=Mapped) to narrow the summary
+    const statusFilter = req.query.status || null;
+    const summary = await rollService.getInventorySummary(statusFilter);
 
     res.status(200).json({
       success: true,
@@ -260,12 +262,22 @@ class RollController {
   });
 
   getUnmappedRolls = catchAsync(async (req, res) => {
-    const unmapped = await rollService.getUnmappedRolls();
+    // Return individual rolls (not grouped) so the UI can select/map them one-by-one.
+    // Uses getAllRolls with status=Unmapped for a consistent, paginated response.
+    const filters = { status: "Unmapped" };
+    const pagination = { page: req.query.page || 1, limit: req.query.limit || 100 };
+
+    const result = await rollService.getAllRolls(filters, pagination);
+
+    const formattedRolls = (result.rolls || []).map((roll) =>
+      this.formatRollResponse(roll)
+    );
 
     res.status(200).json({
       success: true,
-      count: unmapped.length,
-      data: unmapped,
+      count: result.pagination.total,
+      data: formattedRolls,
+      pagination: result.pagination,
     });
   });
 

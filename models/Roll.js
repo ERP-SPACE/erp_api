@@ -78,9 +78,15 @@ const rollSchema = new mongoose.Schema(
     //   type: Object, // Will store complete QR data
     // },
     qrCode: String,
+    // Reference to the PO line subdocument _id (no ref — subdocs are not separate models)
     poLineId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "PurchaseOrderLine",
+    },
+    // Parent PurchaseOrder — populated for traceability from either PI or GRN inward
+    purchaseOrderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PurchaseOrder",
+      default: null,
     },
     purchaseInvoiceId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -89,9 +95,14 @@ const rollSchema = new mongoose.Schema(
     },
     // For allocated/dispatched rolls
     allocationDetails: {
+      // Parent SalesOrder _id — use this for populate(); soLineId is the subdoc _id
+      soId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "SalesOrder",
+      },
+      // Subdocument _id of the SO line (no ref — subdocs are not separate models)
       soLineId: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: "SalesOrderLine",
       },
       allocatedAt: Date,
       allocatedBy: {
@@ -157,6 +168,7 @@ rollSchema.index(
 rollSchema.index({ status: 1, inwardedAt: 1 }); // For unmapped aging
 rollSchema.index({ "allocationDetails.soLineId": 1 });
 rollSchema.index({ purchaseInvoiceId: 1 });
+rollSchema.index({ purchaseOrderId: 1 });
 
 // Virtual for age in days
 rollSchema.virtual("ageInDays").get(function () {

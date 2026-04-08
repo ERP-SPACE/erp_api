@@ -1,3 +1,4 @@
+const mongoose = require("mongoose");
 const PurchaseInvoice = require("../models/PurchaseInvoice");
 const PurchaseOrder = require("../models/PurchaseOrder");
 const Batch = require("../models/Batch");
@@ -101,6 +102,90 @@ const resolvePoLineIdForInvoice = (line = {}, poLineById = new Map(), poLineByKe
   return id;
 };
 
+/** Direct supplier bill: no purchase order; lines carry sku/rates/qty like PO-backed lines. */
+const processDirectPurchaseInvoiceLines = (lines = []) => {
+  let subtotal = 0;
+  const processedLines = (lines || []).map((line, idx) => {
+    const { skuId: _incomingSku, taxRate: _ignoredTaxFromSpread, ...restLine } = line || {};
+    const rollInfo = deriveRollMetrics(line);
+    const qty = toNumber(line.qtyRolls) || rollInfo.rollCount;
+    if (qty <= 0) {
+      throw new AppError(
+        "Invoice quantity must be greater than zero on each line",
+        400,
+        "VALIDATION_ERROR"
+      );
+    }
+
+    const rate = toNumber(line.ratePerRoll);
+    if (rate <= 0) {
+      throw new AppError(
+        "Rate per roll must be greater than zero for direct purchase invoice lines",
+        400,
+        "VALIDATION_ERROR"
+      );
+    }
+
+    const taxRate = toNumber(line.taxRate ?? 0);
+    const lengthMetersPerRoll =
+      rollInfo.lengthPerRoll || toNumber(line.lengthMetersPerRoll);
+
+    let resolvedRollDetails = rollInfo.rollDetails;
+    if (!resolvedRollDetails.length && qty > 0 && lengthMetersPerRoll > 0) {
+      resolvedRollDetails = Array.from({ length: qty }, () => ({
+        lengthMeters: lengthMetersPerRoll,
+      }));
+    }
+
+    const totalMeters =
+      resolvedRollDetails.length > 0
+        ? resolvedRollDetails.reduce((s, r) => s + toNumber(r.lengthMeters), 0)
+        : toNumber(line.totalMeters) || qty * (lengthMetersPerRoll || 0);
+
+    const inwardRolls = resolvedRollDetails.length || rollInfo.rollCount || qty;
+    const inwardMeters = totalMeters;
+
+    const lineBaseTotal = totalMeters * rate;
+    subtotal += lineBaseTotal;
+
+    const rawPoLineId = line.poLineId?.toString?.() || line.poLineId;
+    const poLineId =
+      rawPoLineId && String(rawPoLineId).trim()
+        ? rawPoLineId
+        : `manual-${Date.now()}-${idx}`;
+
+    const rawSkuId = line.skuId?._id || line.skuId;
+    const skuId =
+      rawSkuId && mongoose.Types.ObjectId.isValid(String(rawSkuId))
+        ? rawSkuId
+        : undefined;
+
+    return {
+      ...restLine,
+      poLineId,
+      poId: null,
+      poNumber: line.poNumber || "Manual",
+      ...(skuId ? { skuId } : {}),
+      skuCode: line.skuCode,
+      categoryName: line.categoryName,
+      qualityName: line.qualityName,
+      gsm: line.gsm,
+      widthInches: toNumber(line.widthInches),
+      lengthMetersPerRoll,
+      qtyRolls: qty,
+      ratePerRoll: rate,
+      taxRate,
+      totalMeters,
+      inwardRolls,
+      inwardMeters,
+      rollDetails: resolvedRollDetails,
+      lineTotal: lineBaseTotal,
+    };
+  });
+
+  return { processedLines, subtotal };
+};
+
 // Get all purchase invoices
 const getPurchaseInvoices = handleAsyncErrors(async (req, res) => {
   const { status, supplierId, purchaseOrderId, dateFrom, dateTo } = req.query;
@@ -149,6 +234,7 @@ const createPurchaseInvoice = handleAsyncErrors(async (req, res) => {
     supplierInvoiceNumber,
     supplierChallanNumber,
     purchaseOrderId,
+    supplierId,
     lines = [],
     landedCosts = [],
     notes,
@@ -163,8 +249,101 @@ const createPurchaseInvoice = handleAsyncErrors(async (req, res) => {
     date,
   } = req.body;
 
-  if (!purchaseOrderId) {
-    throw new AppError("Purchase order is required", 400, "VALIDATION_ERROR");
+  const poIdStr = purchaseOrderId && String(purchaseOrderId).trim();
+  const hasValidPurchaseOrder =
+    !!poIdStr && mongoose.Types.ObjectId.isValid(poIdStr);
+
+  if (poIdStr && !hasValidPurchaseOrder) {
+    throw new AppError("Invalid purchase order id", 400, "VALIDATION_ERROR");
+  }
+
+  // Direct supplier bill: no purchase order on file
+  if (!hasValidPurchaseOrder) {
+    if (!supplierId || !mongoose.Types.ObjectId.isValid(String(supplierId))) {
+      throw new AppError(
+        "Supplier is required when no purchase order is linked",
+        400,
+        "VALIDATION_ERROR"
+      );
+    }
+
+    const supplier = await Supplier.findById(supplierId);
+    if (!supplier) {
+      throw new AppError("Supplier not found", 404, "RESOURCE_NOT_FOUND");
+    }
+
+    if (!lines?.length) {
+      throw new AppError(
+        "At least one invoice line is required",
+        400,
+        "VALIDATION_ERROR"
+      );
+    }
+
+    const piNumber = await numberingService.generateNumber("PI", PurchaseInvoice);
+    const { processedLines, subtotal } = processDirectPurchaseInvoiceLines(lines);
+
+    const normalizedSGST = sgst !== undefined ? Number(sgst) || 0 : null;
+    const normalizedCGST = cgst !== undefined ? Number(cgst) || 0 : null;
+    const normalizedIGST = igst !== undefined ? Number(igst) || 0 : null;
+
+    let sgstAmount = normalizedSGST;
+    let cgstAmount = normalizedCGST;
+    let igstAmount = normalizedIGST;
+
+    if (
+      sgstAmount === null ||
+      cgstAmount === null ||
+      igstAmount === null
+    ) {
+      const isInter = gstMode === "inter";
+      sgstAmount = isInter ? 0 : subtotal * 0.09;
+      cgstAmount = isInter ? 0 : subtotal * 0.09;
+      igstAmount = isInter ? subtotal * 0.18 : 0;
+    }
+
+    const taxAmount = (sgstAmount || 0) + (cgstAmount || 0) + (igstAmount || 0);
+
+    const totalLandedCost = (landedCosts || []).reduce(
+      (sum, cost) => sum + (Number(cost.amount) || 0),
+      0
+    );
+
+    const purchaseInvoice = await PurchaseInvoice.create({
+      piNumber,
+      supplierInvoiceNumber,
+      supplierChallanNumber,
+      purchaseOrderId: null,
+      supplierId: supplier._id,
+      supplierName: supplier.name,
+      date: date ? new Date(date) : new Date(),
+      lrNumber,
+      lrDate: lrDate ? new Date(lrDate) : undefined,
+      caseNumber,
+      hsnCode,
+      gstMode,
+      sgst: sgstAmount,
+      cgst: cgstAmount,
+      igst: igstAmount,
+      lines: processedLines,
+      subtotal,
+      taxAmount,
+      total: subtotal + taxAmount,
+      landedCosts,
+      totalLandedCost,
+      grandTotal: subtotal + taxAmount + totalLandedCost,
+      createdBy: req.user?._id || undefined,
+      notes,
+    });
+
+    const populatedInvoice = await PurchaseInvoice.findById(purchaseInvoice._id)
+      .populate("supplierId", "name supplierCode")
+      .populate("purchaseOrderId", "poNumber");
+
+    return res.status(201).json({
+      success: true,
+      data: populatedInvoice,
+    });
   }
 
   // Verify purchase order exists
@@ -401,12 +580,45 @@ const allocateLandedCost = handleAsyncErrors(async (req, res) => {
     throw new AppError("Landed cost not found", 404, "RESOURCE_NOT_FOUND");
   }
 
-  // TODO: Implement landed cost allocation logic
-  // This would involve finding all rolls related to this PI and allocating costs
+  // Find all rolls created from this PI
+  const rolls = await Roll.find({ purchaseInvoiceId: purchaseInvoice._id });
+  if (!rolls.length) {
+    throw new AppError(
+      "No rolls found for this PI. Post the PI first to create rolls.",
+      400,
+      "VALIDATION_ERROR"
+    );
+  }
+
+  const totalCostAmount = toNumber(landedCost.amount);
+  const totalMeters = rolls.reduce(
+    (sum, r) => sum + (r.currentLengthMeters || r.originalLengthMeters || 0),
+    0
+  );
+
+  if (totalMeters <= 0) {
+    throw new AppError("Cannot allocate: total roll meters is zero", 400, "VALIDATION_ERROR");
+  }
+
+  // Distribute landed cost proportionally by roll length
+  const overheadPerMeter = totalCostAmount / totalMeters;
+
+  for (const roll of rolls) {
+    const rollLength = roll.currentLengthMeters || roll.originalLengthMeters || 0;
+    roll.landedCostPerMeter =
+      (roll.landedCostPerMeter || 0) + overheadPerMeter;
+    roll.totalLandedCost =
+      Math.round(roll.landedCostPerMeter * rollLength * 100) / 100;
+    await roll.save();
+  }
+
+  landedCost.allocatedAt = new Date();
+  landedCost.allocatedBy = req.user?._id;
+  await purchaseInvoice.save();
 
   res.json({
     success: true,
-    message: "Landed cost allocation completed",
+    message: `Landed cost of ₹${totalCostAmount.toLocaleString("en-IN")} allocated across ${rolls.length} rolls at ₹${overheadPerMeter.toFixed(4)}/m`,
     data: purchaseInvoice,
   });
 });
@@ -560,7 +772,12 @@ const createRollsForPurchaseInvoice = async (purchaseInvoice) => {
 
   if (!preparedRolls.length) return;
 
-  await Roll.insertMany(preparedRolls);
+  // Save rolls individually so Mongoose pre('save') hooks fire:
+  // barcode, QR code, and totalLandedCost are all generated inside the hook.
+  for (const rollData of preparedRolls) {
+    const roll = new Roll(rollData);
+    await roll.save();
+  }
 
   // Keep batch roll count in sync
   const finalRollCount = await Roll.countDocuments({ batchId: batch._id });
@@ -831,10 +1048,87 @@ const ensurePurchaseInvoiceVoucher = async (purchaseInvoice, userId) => {
   return voucher;
 };
 
+// Update a Draft purchase invoice (header + lines)
+const updatePurchaseInvoice = handleAsyncErrors(async (req, res) => {
+  const pi = await PurchaseInvoice.findById(req.params.id);
+
+  if (!pi) {
+    throw new AppError("Purchase invoice not found", 404, "RESOURCE_NOT_FOUND");
+  }
+
+  if (pi.status !== STATUS.DRAFT) {
+    throw new AppError("Only draft purchase invoices can be edited", 400, "INVALID_STATE_TRANSITION");
+  }
+
+  const {
+    supplierInvoiceNumber,
+    supplierChallanNumber,
+    lrNumber,
+    lrDate,
+    caseNumber,
+    hsnCode,
+    gstMode,
+    sgst,
+    cgst,
+    igst,
+    date,
+    notes,
+    lines,
+    landedCosts,
+  } = req.body;
+
+  if (supplierInvoiceNumber !== undefined) pi.supplierInvoiceNumber = supplierInvoiceNumber;
+  if (supplierChallanNumber !== undefined) pi.supplierChallanNumber = supplierChallanNumber;
+  if (lrNumber !== undefined) pi.lrNumber = lrNumber;
+  if (lrDate !== undefined) pi.lrDate = lrDate ? new Date(lrDate) : null;
+  if (caseNumber !== undefined) pi.caseNumber = caseNumber;
+  if (hsnCode !== undefined) pi.hsnCode = hsnCode;
+  if (gstMode !== undefined) pi.gstMode = gstMode;
+  if (date !== undefined) pi.date = new Date(date);
+  if (notes !== undefined) pi.notes = notes;
+
+  if (lines && Array.isArray(lines)) {
+    pi.lines = lines.map((line) => {
+      const metrics = deriveRollMetrics(line);
+      const lineRate = toNumber(line.ratePerRoll || line.rate || 0);
+      const lineValue = metrics.rollCount * lineRate;
+      const lineTax = lineValue * (toNumber(line.taxRate || line.gstRate || 0) / 100);
+      return {
+        ...line,
+        ...metrics,
+        lineValue,
+        lineTax,
+        lineTotal: lineValue + lineTax,
+      };
+    });
+
+    const subtotal = pi.lines.reduce((s, l) => s + toNumber(l.lineValue), 0);
+    const totalTax = pi.lines.reduce((s, l) => s + toNumber(l.lineTax), 0);
+    pi.subtotal = subtotal;
+    pi.totalTax = totalTax;
+
+    if (sgst !== undefined) pi.sgst = toNumber(sgst);
+    if (cgst !== undefined) pi.cgst = toNumber(cgst);
+    if (igst !== undefined) pi.igst = toNumber(igst);
+    if (gstMode !== undefined) pi.gstMode = gstMode;
+
+    pi.totalAmount = subtotal + toNumber(pi.sgst) + toNumber(pi.cgst) + toNumber(pi.igst);
+  }
+
+  if (landedCosts && Array.isArray(landedCosts)) {
+    pi.landedCosts = landedCosts;
+  }
+
+  await pi.save();
+
+  res.json({ success: true, data: pi });
+});
+
 module.exports = {
   getPurchaseInvoices,
   getPurchaseInvoice,
   createPurchaseInvoice,
+  updatePurchaseInvoice,
   allocateLandedCost,
   postPurchaseInvoice,
 };

@@ -13,22 +13,35 @@ const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
  * Build a fully-processed line object for storage.
  * Runs the allocation algorithm against live inventory and attaches the result.
  *
- * @param {Object}  line    - Raw line from request body
- * @param {Object}  sku     - Mongoose SKU document
- * @param {number}  lineTotal
+ * @param {Object}  line          - Raw line from request body
+ * @param {Object}  sku           - Populated Mongoose SKU document (productId.categoryId / gsmId / qualityId)
+ * @param {number}  lineTotal     - Tax-EXCLUSIVE line value
+ * @param {number}  lineTax       - Tax amount for this line
  * @param {boolean} [runAllocation=true] - Set false in calculatePricing (dry run)
  */
-async function buildProcessedLine(line, sku, lineTotal, runAllocation = true) {
+async function buildProcessedLine(line, sku, lineTotal, lineTax = 0, runAllocation = true) {
   const effectiveTotalMeters =
     line.totalMeters != null && line.totalMeters > 0
       ? Number(line.totalMeters)
       : Number(line.qtyRolls) * Number(line.lengthMetersPerRoll);
 
+  // ── Resolve denormalized product attributes from populated SKU ─────────
+  // SKU model only stores productId; category/gsm/quality come from Product refs.
+  const product = sku.productId;
+  const categoryName =
+    product?.categoryId?.name || product?.category?.name || line.categoryName || "";
+  const qualityName =
+    product?.qualityId?.name || product?.quality?.name || line.qualityName || "";
+  // GSM can be stored as numeric value or as name string
+  const gsmRaw = product?.gsmId;
+  const gsm =
+    (typeof gsmRaw === "object"
+      ? gsmRaw?.value?.toString() || gsmRaw?.name
+      : gsmRaw?.toString()) ||
+    line.gsm ||
+    "";
+
   // ── Auto-allocation against live inventory ─────────────────────────────
-  // Only runs when explicitly enabled and the line has a total-meters target.
-  // If the user already provided manual bifurcations, we still compute allocation
-  // so the SO carries a faithful inventory snapshot, but bifurcations take precedence
-  // for dispatch planning.
   let allocationData = {
     allocation: [],
     allocationStatus: "NOT_CHECKED",
@@ -55,9 +68,9 @@ async function buildProcessedLine(line, sku, lineTotal, runAllocation = true) {
 
   return {
     skuId: line.skuId,
-    categoryName: sku.categoryName,
-    gsm: sku.gsm,
-    qualityName: sku.qualityName,
+    categoryName,
+    gsm,
+    qualityName,
     widthInches: sku.widthInches,
     lengthMetersPerRoll: line.lengthMetersPerRoll,
     qtyRolls: line.qtyRolls,
@@ -65,7 +78,10 @@ async function buildProcessedLine(line, sku, lineTotal, runAllocation = true) {
     bifurcations: Array.isArray(line.bifurcations) ? line.bifurcations : [],
     ...allocationData,
     overrideRatePerRoll: line.overrideRatePerRoll,
+    // lineTotal is tax-EXCLUSIVE; lineTax and lineGrossTotal allow UI to show both
     lineTotal,
+    lineTax,
+    lineGrossTotal: lineTotal + lineTax,
   };
 }
 
@@ -175,12 +191,19 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
   const processedLines = [];
 
   for (const line of lines) {
-    const sku = await SKU.findById(line.skuId);
+    // Populate productId so buildProcessedLine can derive categoryName / gsm / qualityName
+    const sku = await SKU.findById(line.skuId).populate({
+      path: "productId",
+      populate: [
+        { path: "categoryId", select: "name" },
+        { path: "gsmId", select: "name value" },
+        { path: "qualityId", select: "name" },
+      ],
+    });
     if (!sku) {
       throw new AppError(`SKU not found: ${line.skuId}`, 404, "RESOURCE_NOT_FOUND");
     }
 
-    // Calculate pricing using 44" benchmark
     const pricing = pricingService.calculateSalesPricing(
       customer.baseRate44,
       sku.widthInches,
@@ -190,12 +213,14 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
     );
 
     const lineTotal = pricing.lineTotal;
-    const lineTax = lineTotal * (sku.taxRate / 100);
+    // taxRate lives on Product, fall back to SKU taxRate if available
+    const taxRate = sku.productId?.taxRate ?? sku.taxRate ?? 0;
+    const lineTax = lineTotal * (taxRate / 100);
 
     subtotal += lineTotal;
     taxAmount += lineTax;
 
-    processedLines.push(await buildProcessedLine(line, sku, lineTotal + lineTax));
+    processedLines.push(await buildProcessedLine(line, sku, lineTotal, lineTax));
   }
 
   // Populate customerGroupId if it exists
@@ -273,7 +298,14 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
   const processedLines = [];
 
   for (const line of lines) {
-    const sku = await SKU.findById(line.skuId);
+    const sku = await SKU.findById(line.skuId).populate({
+      path: "productId",
+      populate: [
+        { path: "categoryId", select: "name" },
+        { path: "gsmId", select: "name value" },
+        { path: "qualityId", select: "name" },
+      ],
+    });
     if (!sku) {
       throw new AppError(`SKU not found: ${line.skuId}`, 404, "RESOURCE_NOT_FOUND");
     }
@@ -287,12 +319,13 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
     );
 
     const lineTotal = pricing.lineTotal;
-    const lineTax = lineTotal * (sku.taxRate / 100);
+    const taxRate = sku.productId?.taxRate ?? sku.taxRate ?? 0;
+    const lineTax = lineTotal * (taxRate / 100);
 
     subtotal += lineTotal;
     taxAmount += lineTax;
 
-    processedLines.push(await buildProcessedLine(line, sku, lineTotal + lineTax));
+    processedLines.push(await buildProcessedLine(line, sku, lineTotal, lineTax));
   }
 
   const discountAmount = (subtotal * (Number(discountPercent) || 0)) / 100;
@@ -355,11 +388,48 @@ const confirmSalesOrder = handleAsyncErrors(async (req, res) => {
     throw new AppError("Only draft sales orders can be confirmed", 400, "INVALID_STATE_TRANSITION");
   }
 
-  // TODO: Implement credit check logic
-  const creditCheckPassed = true; // Placeholder
+  // Credit check: compare SO total against available credit limit
+  const customer = await Customer.findById(salesOrder.customerId);
+  let creditCheckPassed = true;
+  let creditCheckNotes = "";
+
+  if (customer && customer.creditPolicy) {
+    const policy = customer.creditPolicy;
+
+    if (policy.isBlocked) {
+      throw new AppError(
+        "Customer is blocked — cannot confirm order",
+        400,
+        "CUSTOMER_BLOCKED"
+      );
+    }
+
+    const creditLimit = Number(policy.creditLimit) || 0;
+    if (creditLimit > 0) {
+      // Count outstanding value from other non-cancelled/closed SOs
+      const outstandingSOs = await SalesOrder.aggregate([
+        {
+          $match: {
+            customerId: salesOrder.customerId,
+            _id: { $ne: salesOrder._id },
+            status: { $in: ["Confirmed", "InProgress"] },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$total" } } },
+      ]);
+      const outstandingValue = outstandingSOs[0]?.total || 0;
+      const exposureAfterConfirm = outstandingValue + (salesOrder.total || 0);
+
+      if (exposureAfterConfirm > creditLimit) {
+        creditCheckPassed = false;
+        creditCheckNotes = `Credit limit ₹${creditLimit.toLocaleString("en-IN")} would be exceeded. Current exposure: ₹${outstandingValue.toLocaleString("en-IN")}, this order: ₹${(salesOrder.total || 0).toLocaleString("en-IN")}.`;
+      }
+    }
+  }
 
   salesOrder.status = "Confirmed";
   salesOrder.creditCheckPassed = creditCheckPassed;
+  salesOrder.creditCheckNotes = creditCheckNotes || salesOrder.creditCheckNotes;
   salesOrder.confirmedBy = req.user ? req.user._id : undefined;
   salesOrder.confirmedAt = new Date();
   await salesOrder.save();

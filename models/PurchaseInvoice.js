@@ -27,10 +27,11 @@ const purchaseInvoiceSchema = new mongoose.Schema(
       required: true,
     },
     supplierInvoiceNumber: String,
+    /** Set when the invoice is raised against a PO; omit or null for direct supplier bills (no PO). */
     purchaseOrderId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "PurchaseOrder",
-      required: true,
+      required: false,
     },
     supplierId: {
       type: mongoose.Schema.Types.ObjectId,

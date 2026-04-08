@@ -1,12 +1,13 @@
 // services/pricingService.js
 const CustomerRate = require("../models/CustomerRate");
-const Product = require("../models/Product");
+const SKU = require("../models/SKU");
 const AppError = require("../utils/AppError");
 
 class PricingService {
   /**
-   * Lightweight sales pricing calculation given base rate and dimensions.
-   * Mirrors UI logic (44" benchmark -> derived, final, line total).
+   * Lightweight sales pricing calculation given a 44" base rate and dimensions.
+   * Mirrors the UI logic: 44" benchmark → derived rate per roll → line total.
+   * Tax is handled by the caller after this returns.
    */
   calculateSalesPricing(
     baseRate44,
@@ -20,14 +21,13 @@ class PricingService {
     const length = Number(lengthMetersPerRoll) || 0;
     const base = Number(baseRate44) || 0;
 
-    const derivedRatePerRoll =
-      width > 0 ? Math.round(base * (width / 44)) : 0;
+    const derivedRatePerRoll = width > 0 ? Math.round(base * (width / 44)) : 0;
     const finalRatePerRoll =
       overrideRatePerRoll !== undefined && overrideRatePerRoll !== null
         ? Number(overrideRatePerRoll) || 0
         : derivedRatePerRoll;
 
-    const lineTotal = finalRatePerRoll * qty; // tax handled by caller
+    const lineTotal = finalRatePerRoll * qty;
 
     return {
       derivedRatePerRoll,
@@ -38,41 +38,37 @@ class PricingService {
   }
 
   /**
-   * Calculate price based on 44" benchmark
+   * Look up the customer-specific rate for a given SKU, then compute pricing.
+   * CustomerRate is keyed by (customerId, skuId) — width is already baked into
+   * the SKU, so no 44" benchmark derivation is needed here.
    */
-  async calculatePrice(
-    customerId,
-    productId,
-    widthInches,
-    quantityRolls,
-    lengthMeters = 1000
-  ) {
-    // Get active rate for customer-product
-    const rate = await CustomerRate.getActiveRate(customerId, productId);
+  async calculatePrice(customerId, skuId, quantityRolls, lengthMeters = 1000) {
+    // CustomerRate.getActiveRate(customerId, skuId) — see CustomerRate.js static
+    const rate = await CustomerRate.getActiveRate(customerId, skuId);
 
     if (!rate) {
       throw new AppError(
-        "No rate defined for this customer-product combination",
+        "No rate defined for this customer-SKU combination",
         404
       );
     }
 
-    // Calculate rate for specific width
-    const ratePerRoll = this.calculateWidthRate(rate.baseRate44, widthInches);
-
-    // Calculate totals
+    // Rate stored per roll (not per meter) — CustomerRate.baseRate is the roll rate
+    const ratePerRoll = Number(rate.baseRate);
     const subtotal = ratePerRoll * quantityRolls;
 
-    // Get product for tax rate
-    const product = await Product.findById(productId).populate("category");
-    const taxRate = product.category.defaultTaxRate || 18;
+    // Get SKU → Product for tax rate
+    const sku = await SKU.findById(skuId).populate({
+      path: "productId",
+      select: "taxRate",
+    });
+    const taxRate = sku?.productId?.taxRate || 18;
     const taxAmount = Math.round(((subtotal * taxRate) / 100) * 100) / 100;
     const total = subtotal + taxAmount;
 
     return {
-      baseRate44: rate.baseRate44,
-      widthInches,
-      lengthMeters,
+      baseRate: ratePerRoll,
+      skuId,
       quantityRolls,
       ratePerRoll,
       subtotal,
@@ -80,40 +76,25 @@ class PricingService {
       taxAmount,
       total,
       rateId: rate._id,
-      formula: `₹${rate.baseRate44} × (${widthInches}/44) = ₹${ratePerRoll}`,
     };
   }
 
   /**
-   * Calculate rate for any width based on 44" benchmark
+   * Calculate rate for any width based on 44" benchmark (used for ad-hoc pricing).
    */
   calculateWidthRate(baseRate44, widthInches) {
-    const calculatedRate = baseRate44 * (widthInches / 44);
-    return Math.round(calculatedRate); // Round to nearest rupee
+    return Math.round(Number(baseRate44) * (Number(widthInches) / 44));
   }
 
   /**
-   * Apply override rate with validation
+   * Apply override rate with deviation validation.
    */
-  async applyOverrideRate(
-    originalPrice,
-    overrideRate44,
-    widthInches,
-    reason,
-    userId
-  ) {
-    const overrideRatePerRoll = this.calculateWidthRate(
-      overrideRate44,
-      widthInches
-    );
+  async applyOverrideRate(originalPrice, overrideRate44, widthInches, reason, userId) {
+    const overrideRatePerRoll = this.calculateWidthRate(overrideRate44, widthInches);
     const originalRatePerRoll = originalPrice.ratePerRoll;
 
-    // Calculate deviation
-    const deviation =
-      Math.abs(overrideRatePerRoll - originalRatePerRoll) / originalRatePerRoll;
+    const deviation = Math.abs(overrideRatePerRoll - originalRatePerRoll) / originalRatePerRoll;
     const deviationPercent = Math.round(deviation * 100);
-
-    // Check if approval needed (> 5% deviation)
     const requiresApproval = deviation > 0.05;
 
     return {
@@ -130,90 +111,98 @@ class PricingService {
   }
 
   /**
-   * Get price matrix for a customer (all products and widths)
+   * Get price matrix for a customer — all active SKU rates.
+   * CustomerRate is SKU-level; we populate the SKU → Product chain for display names.
    */
   async getCustomerPriceMatrix(customerId) {
     const rates = await CustomerRate.find({
       customerId,
       active: true,
+      validTo: null,
     }).populate({
-      path: "productId",
-      populate: [
-        { path: "categoryId" },
-        { path: "gsmId" },
-        { path: "qualityId" },
-      ],
+      path: "skuId",
+      select: "skuCode widthInches productId",
+      populate: {
+        path: "productId",
+        select: "productCode productAlias taxRate",
+        populate: [
+          { path: "categoryId", select: "name" },
+          { path: "gsmId", select: "name value" },
+          { path: "qualityId", select: "name" },
+        ],
+      },
     });
 
-    const widths = [24, 36, 44, 63];
-    const matrix = [];
-
-    for (const rate of rates) {
-      const productRates = {
-        productId: rate.productId._id,
-        productName: `${rate.productId.categoryId?.name || ""} ${rate.productId.gsmId?.name || ""} ${rate.productId.qualityId?.name || ""}`,
-        baseRate44: rate.baseRate44,
-        rates: {},
+    return rates.map((rate) => {
+      const sku = rate.skuId;
+      const product = sku?.productId;
+      return {
+        rateId: rate._id,
+        skuId: sku?._id,
+        skuCode: sku?.skuCode,
+        widthInches: sku?.widthInches,
+        productName: product?.productAlias || product?.productCode || "",
+        categoryName: product?.categoryId?.name || "",
+        gsm: product?.gsmId?.value?.toString() || product?.gsmId?.name || "",
+        qualityName: product?.qualityId?.name || "",
+        baseRate: rate.baseRate,
+        validFrom: rate.validFrom,
+        isSpecialRate: rate.isSpecialRate,
       };
-
-      for (const width of widths) {
-        productRates.rates[`w${width}`] = this.calculateWidthRate(
-          rate.baseRate44,
-          width
-        );
-      }
-
-      matrix.push(productRates);
-    }
-
-    return matrix;
+    });
   }
 
   /**
-   * Bulk rate revision
+   * Bulk rate revision — applies a percentage or flat adjustment to all active
+   * SKU rates for a customer. Creates a new rate record and expires the old one.
+   * All fields reference CustomerRate schema: skuId + baseRate.
    */
-  async bulkRateRevision(customerId, revisionType, value, productIds = null) {
-    const query = { customerId, active: true };
-    if (productIds) {
-      query.productId = { $in: productIds };
+  async bulkRateRevision(customerId, revisionType, value, skuIds = null) {
+    const query = { customerId, active: true, validTo: null };
+    if (skuIds && skuIds.length) {
+      query.skuId = { $in: skuIds };
     }
 
     const rates = await CustomerRate.find(query);
     const updates = [];
 
     for (const rate of rates) {
-      let newRate44;
+      const currentRate = Number(rate.baseRate);
+      let newBaseRate;
 
       if (revisionType === "PERCENTAGE") {
-        // Percentage increase/decrease
-        newRate44 = Math.round(rate.baseRate44 * (1 + value / 100));
+        newBaseRate = Math.round(currentRate * (1 + value / 100));
       } else if (revisionType === "FLAT") {
-        // Flat increase/decrease per meter
-        newRate44 = rate.baseRate44 + value;
+        newBaseRate = currentRate + value;
       } else {
-        throw new AppError("Invalid revision type", 400);
+        throw new AppError("Invalid revision type. Use PERCENTAGE or FLAT.", 400);
       }
 
+      if (newBaseRate < 0) newBaseRate = 0;
+
       updates.push({
-        productId: rate.productId,
-        oldRate44: rate.baseRate44,
-        newRate44,
-        change: newRate44 - rate.baseRate44,
-        changePercent: Math.round(
-          ((newRate44 - rate.baseRate44) / rate.baseRate44) * 100
-        ),
+        skuId: rate.skuId,
+        oldRate: currentRate,
+        newRate: newBaseRate,
+        change: newBaseRate - currentRate,
+        changePercent: currentRate > 0
+          ? Math.round(((newBaseRate - currentRate) / currentRate) * 100)
+          : 0,
       });
 
-      // Deactivate old rate
+      // Expire old rate
       rate.active = false;
       rate.validTo = new Date();
       await rate.save();
 
-      // Create new rate
+      // Create new rate with correct field names
       await CustomerRate.create({
         customerId,
-        productId: rate.productId,
-        baseRate44: newRate44,
+        skuId: rate.skuId,
+        baseRate: newBaseRate,
+        validFrom: new Date(),
+        validTo: null,
+        active: true,
         notes: `Bulk revision: ${revisionType} ${value}`,
       });
     }
@@ -222,7 +211,7 @@ class PricingService {
   }
 
   /**
-   * Calculate deal rate for special orders
+   * Calculate deal rate for special orders with a flat discount across all items.
    */
   async calculateDealRate(customerId, items, dealDiscount) {
     const pricing = [];
@@ -232,24 +221,17 @@ class PricingService {
     for (const item of items) {
       const originalPrice = await this.calculatePrice(
         customerId,
-        item.productId,
-        item.widthInches,
+        item.skuId,
         item.quantity
       );
 
-      const dealRate44 = Math.round(
-        originalPrice.baseRate44 * (1 - dealDiscount / 100)
-      );
-      const dealRatePerRoll = this.calculateWidthRate(
-        dealRate44,
-        item.widthInches
+      const dealRatePerRoll = Math.round(
+        originalPrice.ratePerRoll * (1 - dealDiscount / 100)
       );
       const dealSubtotal = dealRatePerRoll * item.quantity;
 
       pricing.push({
         ...item,
-        originalRate44: originalPrice.baseRate44,
-        dealRate44,
         originalRatePerRoll: originalPrice.ratePerRoll,
         dealRatePerRoll,
         originalSubtotal: originalPrice.subtotal,
@@ -266,9 +248,10 @@ class PricingService {
       totalOriginal,
       totalDeal,
       totalSavings: totalOriginal - totalDeal,
-      savingsPercent: Math.round(
-        ((totalOriginal - totalDeal) / totalOriginal) * 100
-      ),
+      savingsPercent:
+        totalOriginal > 0
+          ? Math.round(((totalOriginal - totalDeal) / totalOriginal) * 100)
+          : 0,
       dealDiscount,
     };
   }

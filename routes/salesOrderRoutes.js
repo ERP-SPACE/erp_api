@@ -21,6 +21,10 @@ router.route("/")
   .get(getSalesOrders)
   .post(createSalesOrder);
 
+// Static action routes BEFORE /:id to prevent "calculate-pricing" being matched as an id
+router.post("/calculate-pricing", calculatePricing);
+router.post("/preview-allocation", previewAllocation);
+
 router.route("/:id")
   .get(getSalesOrder)
   .put(updateSalesOrder);
@@ -29,7 +33,5 @@ router.post("/:id/confirm", confirmSalesOrder);
 router.post("/:id/cancel", cancelSalesOrder);
 router.post("/:id/hold", holdSalesOrder);
 router.post("/:id/close", closeSalesOrder);
-router.post("/calculate-pricing", calculatePricing);
-router.post("/preview-allocation", previewAllocation);
 
 module.exports = router;

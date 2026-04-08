@@ -8,9 +8,10 @@ const { authenticate } = require("../middlewares/auth");
 router.use(authenticate);
 
 router.get("/", skuController.getAllSKUs);
+// Static routes MUST come before /:id — otherwise Express matches them as the id param
 router.get("/available", skuController.getAvailableSKUs);
-router.get("/:id", skuController.getSKUById);
 router.get("/code/:code", skuController.getSKUByCode);
+router.get("/:id", skuController.getSKUById);
 
 router.post("/", skuController.createSKU);
 router.post("/bulk", skuController.bulkCreateSKUs);

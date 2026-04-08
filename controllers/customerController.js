@@ -364,7 +364,7 @@ const updateCustomer = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Check credit (simplified version for now)
+// Check credit — computes real exposure from open SalesOrders
 const checkCredit = handleAsyncErrors(async (req, res) => {
   const customerId = req.params.id;
   const customer = await Customer.findById(customerId).populate(
@@ -375,52 +375,42 @@ const checkCredit = handleAsyncErrors(async (req, res) => {
     throw new AppError("Customer not found", 404, "RESOURCE_NOT_FOUND");
   }
 
-  // Check if customer is already blocked
   const isBlocked = customer.creditPolicy?.isBlocked || false;
   const blockReason = customer.creditPolicy?.blockReason || null;
+  const creditLimit = Number(customer.creditPolicy?.creditLimit) || 0;
 
-  if (isBlocked) {
-    return res.json({
-      success: true,
-      data: {
-        blocked: true,
-        reasons: blockReason ? [blockReason] : ["Customer is blocked"],
-        exposure: customer.creditPolicy?.currentExposure || 0,
-        creditLimit: customer.creditPolicy?.creditLimit || 0,
-        outstandingAR: 0, // TODO: Calculate from invoices
-        pendingSOValue: 0, // TODO: Calculate from pending orders
+  // Calculate pending SO value (Confirmed or InProgress)
+  const SalesOrder = require("../models/SalesOrder");
+  const pendingSOAgg = await SalesOrder.aggregate([
+    {
+      $match: {
+        customerId: customer._id,
+        status: { $in: ["Confirmed", "InProgress"] },
       },
-    });
-  }
-
-  if (!customer.creditPolicy?.autoBlock) {
-    return res.json({
-      success: true,
-      data: {
-        blocked: false,
-        reason: "Auto-blocking disabled",
-        exposure: customer.creditPolicy?.currentExposure || 0,
-        creditLimit: customer.creditPolicy?.creditLimit || 0,
-        outstandingAR: 0,
-        pendingSOValue: 0,
-      },
-    });
-  }
-
-  // For now, return simplified credit check without complex calculations
-  // TODO: Implement full credit check logic when SalesInvoice/SalesOrder are fully implemented
-  res.json({
-    success: true,
-    data: {
-      blocked: false,
-      reason: "Credit check simplified - full implementation pending",
-      exposure: customer.creditPolicy?.currentExposure || 0,
-      creditLimit: customer.creditPolicy?.creditLimit || 0,
-      outstandingAR: 0,
-      pendingSOValue: 0,
-      note: "This is a placeholder. Full credit checking will be implemented with sales module.",
     },
-  });
+    { $group: { _id: null, total: { $sum: "$total" } } },
+  ]);
+  const pendingSOValue = pendingSOAgg[0]?.total || 0;
+
+  const exposure = pendingSOValue;
+  const availableCredit = Math.max(0, creditLimit - exposure);
+  const overLimit = creditLimit > 0 && exposure > creditLimit;
+
+  const result = {
+    blocked: isBlocked || (customer.creditPolicy?.autoBlock && overLimit),
+    reasons: [],
+    creditLimit,
+    exposure,
+    pendingSOValue,
+    outstandingAR: 0, // Will be populated when AR/invoicing is implemented
+    availableCredit,
+    overLimit,
+  };
+
+  if (isBlocked) result.reasons.push(blockReason || "Customer is manually blocked");
+  if (overLimit) result.reasons.push(`Credit limit ₹${creditLimit.toLocaleString("en-IN")} exceeded by ₹${(exposure - creditLimit).toLocaleString("en-IN")}`);
+
+  res.json({ success: true, data: result });
 });
 
 // Block customer
@@ -576,6 +566,59 @@ const getRateHistory = handleAsyncErrors(async (req, res) => {
   res.json({ success: true, count: history.length, data: history });
 });
 
+// Bulk update rates for a customer (percentage or flat revision across all SKUs)
+const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
+  const { id } = req.params;
+  const { rateUpdates = [] } = req.body;
+
+  if (!Array.isArray(rateUpdates) || !rateUpdates.length) {
+    throw new AppError("rateUpdates array is required", 400, "VALIDATION_ERROR");
+  }
+
+  const results = { updated: [], failed: [] };
+
+  for (const update of rateUpdates) {
+    const { skuId, baseRate, notes, isSpecialRate, specialRateReason } = update;
+    if (!skuId || baseRate === undefined || baseRate === null) {
+      results.failed.push({ skuId, reason: "skuId and baseRate are required" });
+      continue;
+    }
+
+    const numericRate = sanitizeNumericValue(baseRate);
+    if (numericRate < 0) {
+      results.failed.push({ skuId, reason: "Rate must be non-negative" });
+      continue;
+    }
+
+    try {
+      // Expire existing active rate
+      await CustomerRate.updateMany(
+        { customerId: id, skuId, active: true, validTo: null },
+        { $set: { active: false, validTo: new Date() } }
+      );
+
+      const rate = await CustomerRate.create({
+        customerId: id,
+        skuId,
+        baseRate: numericRate,
+        validFrom: new Date(),
+        validTo: null,
+        active: true,
+        notes: notes || "",
+        isSpecialRate: isSpecialRate || false,
+        specialRateReason: isSpecialRate ? specialRateReason : undefined,
+        approvedBy: req.user?._id,
+      });
+
+      results.updated.push({ skuId, rateId: rate._id, baseRate: numericRate });
+    } catch (err) {
+      results.failed.push({ skuId, reason: err.message });
+    }
+  }
+
+  res.json({ success: true, data: results });
+});
+
 module.exports = {
   getCustomers,
   getCustomer,
@@ -589,4 +632,5 @@ module.exports = {
   setCustomerRate,
   deleteCustomerRate,
   getRateHistory,
+  bulkUpdateCustomerRates,
 };

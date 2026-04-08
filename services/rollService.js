@@ -175,7 +175,13 @@ class RollService {
       });
     }
 
-    const created = await Roll.insertMany(prepared);
+    // Save individually so pre('save') hooks fire (barcode, qrCode generation)
+    const created = [];
+    for (const rollData of prepared) {
+      const roll = new Roll(rollData);
+      await roll.save();
+      created.push(roll);
+    }
     return created;
   }
 
@@ -435,8 +441,11 @@ class RollService {
     return roll;
   }
 
-  async getInventorySummary() {
+  async getInventorySummary(statusFilter = null) {
+    const matchStage = statusFilter ? { $match: { status: statusFilter } } : null;
+
     const summary = await Roll.aggregate([
+      ...(matchStage ? [matchStage] : []),
       {
         $lookup: {
           from: "skus",

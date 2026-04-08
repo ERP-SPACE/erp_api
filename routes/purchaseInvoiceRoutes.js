@@ -5,6 +5,7 @@ const {
   getPurchaseInvoices,
   getPurchaseInvoice,
   createPurchaseInvoice,
+  updatePurchaseInvoice,
   allocateLandedCost,
   postPurchaseInvoice,
 } = require("../controllers/purchaseInvoiceController");
@@ -17,7 +18,8 @@ router.route("/")
   .post(createPurchaseInvoice);
 
 router.route("/:id")
-  .get(getPurchaseInvoice);
+  .get(getPurchaseInvoice)
+  .put(updatePurchaseInvoice);
 
 router.post("/:id/allocate-landed-cost", allocateLandedCost);
 router.post("/:id/post", postPurchaseInvoice);

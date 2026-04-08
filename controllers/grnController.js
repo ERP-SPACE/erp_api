@@ -1,7 +1,11 @@
 const GRN = require("../models/GRN");
 const PurchaseOrder = require("../models/PurchaseOrder");
+const PurchaseInvoice = require("../models/PurchaseInvoice");
+const Batch = require("../models/Batch");
 const Roll = require("../models/Roll");
+const Supplier = require("../models/Supplier");
 const numberingService = require("../services/numberingService");
+const { PURCHASE_ORDER_STATUS } = require("../config/constants");
 const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
 
 // Get all GRNs
@@ -23,11 +27,7 @@ const getGRNs = handleAsyncErrors(async (req, res) => {
     .populate("supplierId", "name supplierCode")
     .sort({ createdAt: -1 });
 
-  res.json({
-    success: true,
-    count: grns.length,
-    data: grns,
-  });
+  res.json({ success: true, count: grns.length, data: grns });
 });
 
 // Get single GRN
@@ -40,65 +40,101 @@ const getGRN = handleAsyncErrors(async (req, res) => {
     throw new AppError("GRN not found", 404, "RESOURCE_NOT_FOUND");
   }
 
-  res.json({
-    success: true,
-    data: grn,
-  });
+  res.json({ success: true, data: grn });
 });
 
 // Create GRN
 const createGRN = handleAsyncErrors(async (req, res) => {
   const { purchaseOrderId, lines, notes } = req.body;
 
-  // Verify purchase order exists
-  const purchaseOrder = await PurchaseOrder.findById(purchaseOrderId);
+  const purchaseOrder = await PurchaseOrder.findById(purchaseOrderId).populate(
+    "supplierId",
+    "name supplierCode"
+  );
   if (!purchaseOrder) {
     throw new AppError("Purchase order not found", 404, "RESOURCE_NOT_FOUND");
   }
 
-  // Generate GRN number
-  const grnNumber = await numberingService.generateNumber("GRN", GRN);
+  // Guard: a Posted PI already provides rolls for this PO — block duplicate GRN creation.
+  // Draft PIs are fine (GRN is an alternative inward, not a duplicate).
+  const existingPostedPI = await PurchaseInvoice.findOne({
+    purchaseOrderId,
+    status: "Posted",
+  });
+  if (existingPostedPI) {
+    throw new AppError(
+      `A posted Purchase Invoice (${existingPostedPI.piNumber}) already exists for this PO. ` +
+        "Use the PI workflow to inward goods.",
+      400,
+      "DUPLICATE_INWARD"
+    );
+  }
 
-  // Process lines and create rolls
+  if (
+    purchaseOrder.poStatus === PURCHASE_ORDER_STATUS.CLOSED ||
+    purchaseOrder.poStatus === PURCHASE_ORDER_STATUS.CANCELLED
+  ) {
+    throw new AppError(
+      "Cannot create GRN for a closed or cancelled PO",
+      400,
+      "INVALID_STATE_TRANSITION"
+    );
+  }
+
+  const grnNumber = await numberingService.generateNumber("GRN", GRN);
+  const supplier = purchaseOrder.supplierId; // already populated
+
+  // Create a Batch record for this GRN inward
+  const batch = new Batch({
+    supplierId: supplier._id || supplier,
+    notes: `GRN inward - ${grnNumber}`,
+  });
+  await batch.save(); // pre-save hook generates batchCode
+
   const processedLines = [];
-  const rollsToCreate = [];
+  let rollSequence = 0;
 
   for (const line of lines) {
     const poLine = purchaseOrder.lines.id(line.poLineId);
     if (!poLine) {
-      throw new AppError(`PO line not found: ${line.poLineId}`, 400, "VALIDATION_ERROR");
+      throw new AppError(
+        `PO line not found: ${line.poLineId}`,
+        400,
+        "VALIDATION_ERROR"
+      );
     }
 
     const qtyRolls = Number(line.qtyRolls ?? poLine.qtyRolls) || 0;
     const lengthMetersPerRoll =
       Number(line.lengthMetersPerRoll ?? poLine.lengthMetersPerRoll) || 0;
 
-    // Create rolls for received quantity (now based on qtyRolls from PO/UI)
+    // Create rolls one-by-one so the pre('save') hook generates barcode + qrCode
     for (let i = 0; i < qtyRolls; i++) {
-      const rollNumber = numberingService.generateRollNumber(
-        purchaseOrder.supplierId.toString(),
-        "BATCH001", // TODO: Get from actual batch
-        i + 1
-      );
+      rollSequence++;
+      const rollNumber = `${grnNumber}-R${String(rollSequence).padStart(4, "0")}`;
 
-      rollsToCreate.push({
+      const roll = new Roll({
         rollNumber,
-        skuId: poLine.skuId,
-        batchId: null, // TODO: Link to actual batch
-        supplierId: purchaseOrder.supplierId,
+        skuId: poLine.skuId || null,
+        batchId: batch._id,
+        supplierId: supplier._id || supplier,
+        purchaseOrderId: purchaseOrder._id,
         categoryName: poLine.categoryName,
         gsm: poLine.gsm,
         qualityName: poLine.qualityName,
         widthInches: poLine.widthInches,
-        originalLengthMeters: lengthMetersPerRoll || 0,
-        currentLengthMeters: lengthMetersPerRoll || 0,
-        status: "Unmapped",
-        purchaseOrderId: purchaseOrder._id,
+        originalLengthMeters: lengthMetersPerRoll,
+        currentLengthMeters: lengthMetersPerRoll,
+        // Start as Mapped if SKU known; Unmapped otherwise
+        status: poLine.skuId ? "Mapped" : "Unmapped",
+        poLineId: poLine._id,
       });
+
+      await roll.save();
     }
 
     processedLines.push({
-      poLineId: line.poLineId,
+      poLineId: poLine._id,
       skuId: poLine.skuId,
       skuCode: poLine.skuCode,
       categoryName: poLine.categoryName,
@@ -107,41 +143,61 @@ const createGRN = handleAsyncErrors(async (req, res) => {
       widthInches: poLine.widthInches,
       lengthMetersPerRoll: poLine.lengthMetersPerRoll,
       qtyRolls: poLine.qtyRolls,
-      totalMeters: poLine.totalMeters,
+      receivedQtyRolls: qtyRolls,
+      totalMeters: qtyRolls * lengthMetersPerRoll,
       ratePerRoll: poLine.ratePerRoll,
       lineTotal: poLine.lineTotal,
     });
   }
 
-  // Create rolls
-  const createdRolls = await Roll.insertMany(rollsToCreate);
-
   const grn = await GRN.create({
     grnNumber,
     purchaseOrderId,
     poNumber: purchaseOrder.poNumber,
-    supplierId: purchaseOrder.supplierId,
-    supplierName: purchaseOrder.supplierName,
+    supplierId: supplier._id || supplier,
+    supplierName: purchaseOrder.supplierName || supplier.name,
+    batchId: batch._id,
     lines: processedLines,
     notes,
     createdBy: req.user ? req.user._id : undefined,
   });
 
-  // Update purchase order received quantities
+  // Update PO received quantities and status
+  let allLinesReceived = true;
+  let anyLineReceived = false;
+
   for (const line of processedLines) {
     const poLine = purchaseOrder.lines.id(line.poLineId);
-    poLine.receivedQty += Number(line.qtyRolls) || 0;
+    if (!poLine) continue;
+
+    poLine.receivedQty = (Number(poLine.receivedQty) || 0) + line.receivedQtyRolls;
+    if (poLine.receivedQty < poLine.qtyRolls) {
+      allLinesReceived = false;
+    } else {
+      anyLineReceived = true;
+    }
   }
+
+  if (allLinesReceived) {
+    // All PO lines fully received → mark PO as Complete
+    purchaseOrder.poStatus = PURCHASE_ORDER_STATUS.COMPLETE;
+  } else if (anyLineReceived) {
+    // Some lines partially received
+    purchaseOrder.poStatus = PURCHASE_ORDER_STATUS.PARTIAL;
+  }
+
   await purchaseOrder.save();
+
+  // Keep batch roll count in sync
+  const finalRollCount = await Roll.countDocuments({ batchId: batch._id });
+  batch.totalRolls = finalRollCount;
+  await batch.save();
 
   const populatedGRN = await GRN.findById(grn._id)
     .populate("purchaseOrderId", "poNumber supplierName")
     .populate("supplierId", "name supplierCode");
 
-  res.status(201).json({
-    success: true,
-    data: populatedGRN,
-  });
+  res.status(201).json({ success: true, data: populatedGRN });
 });
 
 // Post GRN (finalize)
@@ -153,7 +209,11 @@ const postGRN = handleAsyncErrors(async (req, res) => {
   }
 
   if (grn.status !== "Draft") {
-    throw new AppError("Only draft GRNs can be posted", 400, "INVALID_STATE_TRANSITION");
+    throw new AppError(
+      "Only draft GRNs can be posted",
+      400,
+      "INVALID_STATE_TRANSITION"
+    );
   }
 
   grn.status = "Posted";
@@ -161,10 +221,7 @@ const postGRN = handleAsyncErrors(async (req, res) => {
   grn.postedAt = new Date();
   await grn.save();
 
-  res.json({
-    success: true,
-    data: grn,
-  });
+  res.json({ success: true, data: grn });
 });
 
 module.exports = {
