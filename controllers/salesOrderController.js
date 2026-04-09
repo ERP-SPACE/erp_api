@@ -388,7 +388,7 @@ const confirmSalesOrder = handleAsyncErrors(async (req, res) => {
     throw new AppError("Only draft sales orders can be confirmed", 400, "INVALID_STATE_TRANSITION");
   }
 
-  // Credit check: compare SO total against available credit limit
+  // Credit check: compare (outstanding AR + pending SO + this SO) against limit
   const customer = await Customer.findById(salesOrder.customerId);
   let creditCheckPassed = true;
   let creditCheckNotes = "";
@@ -406,28 +406,63 @@ const confirmSalesOrder = handleAsyncErrors(async (req, res) => {
 
     const creditLimit = Number(policy.creditLimit) || 0;
     if (creditLimit > 0) {
-      // Count outstanding value from other non-cancelled/closed SOs
+      // Count pending SO value from other confirmed/partially-fulfilled SOs
       const outstandingSOs = await SalesOrder.aggregate([
         {
           $match: {
             customerId: salesOrder.customerId,
             _id: { $ne: salesOrder._id },
-            status: { $in: ["Confirmed", "InProgress"] },
+            status: { $in: ["Confirmed", "PartiallyFulfilled"] },
           },
         },
         { $group: { _id: null, total: { $sum: "$total" } } },
       ]);
-      const outstandingValue = outstandingSOs[0]?.total || 0;
-      const exposureAfterConfirm = outstandingValue + (salesOrder.total || 0);
+      const pendingSOValue = outstandingSOs[0]?.total || 0;
+
+      // Count outstanding AR from posted invoices
+      const SalesInvoice = require("../models/SalesInvoice");
+      const outstandingAgg = await SalesInvoice.aggregate([
+        {
+          $match: {
+            customerId: salesOrder.customerId,
+            status: "Posted",
+            paymentStatus: { $ne: "Paid" },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: {
+              $sum: {
+                $cond: [
+                  { $gt: ["$outstandingAmount", 0] },
+                  "$outstandingAmount",
+                  {
+                    $subtract: [
+                      { $ifNull: ["$total", 0] },
+                      { $ifNull: ["$paidAmount", 0] },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ]);
+      const outstandingAR = outstandingAgg[0]?.total || 0;
+      const exposureAfterConfirm = outstandingAR + pendingSOValue + (salesOrder.total || 0);
 
       if (exposureAfterConfirm > creditLimit) {
         creditCheckPassed = false;
-        creditCheckNotes = `Credit limit ₹${creditLimit.toLocaleString("en-IN")} would be exceeded. Current exposure: ₹${outstandingValue.toLocaleString("en-IN")}, this order: ₹${(salesOrder.total || 0).toLocaleString("en-IN")}.`;
+        creditCheckNotes = `Credit limit ₹${creditLimit.toLocaleString("en-IN")} would be exceeded. Current exposure: ₹${(outstandingAR + pendingSOValue).toLocaleString("en-IN")}, this order: ₹${(salesOrder.total || 0).toLocaleString("en-IN")}.`;
       }
     }
   }
 
-  salesOrder.status = "Confirmed";
+  salesOrder.status = creditCheckPassed ? "Confirmed" : STATUS.ON_HOLD;
+  if (!creditCheckPassed) {
+    salesOrder.onHoldReason = creditCheckNotes || "Credit check failed";
+  }
   salesOrder.creditCheckPassed = creditCheckPassed;
   salesOrder.creditCheckNotes = creditCheckNotes || salesOrder.creditCheckNotes;
   salesOrder.confirmedBy = req.user ? req.user._id : undefined;

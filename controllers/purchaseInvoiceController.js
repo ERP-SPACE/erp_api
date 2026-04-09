@@ -1091,33 +1091,45 @@ const updatePurchaseInvoice = handleAsyncErrors(async (req, res) => {
     pi.lines = lines.map((line) => {
       const metrics = deriveRollMetrics(line);
       const lineRate = toNumber(line.ratePerRoll || line.rate || 0);
-      const lineValue = metrics.rollCount * lineRate;
-      const lineTax = lineValue * (toNumber(line.taxRate || line.gstRate || 0) / 100);
+      const lineSubtotal = toNumber(metrics.totalMeters) * lineRate;
+      const lineTax = lineSubtotal * (toNumber(line.taxRate || line.gstRate || 0) / 100);
       return {
         ...line,
         ...metrics,
-        lineValue,
-        lineTax,
-        lineTotal: lineValue + lineTax,
+        lineTotal: lineSubtotal + lineTax,
       };
     });
-
-    const subtotal = pi.lines.reduce((s, l) => s + toNumber(l.lineValue), 0);
-    const totalTax = pi.lines.reduce((s, l) => s + toNumber(l.lineTax), 0);
-    pi.subtotal = subtotal;
-    pi.totalTax = totalTax;
-
-    if (sgst !== undefined) pi.sgst = toNumber(sgst);
-    if (cgst !== undefined) pi.cgst = toNumber(cgst);
-    if (igst !== undefined) pi.igst = toNumber(igst);
-    if (gstMode !== undefined) pi.gstMode = gstMode;
-
-    pi.totalAmount = subtotal + toNumber(pi.sgst) + toNumber(pi.cgst) + toNumber(pi.igst);
   }
 
   if (landedCosts && Array.isArray(landedCosts)) {
     pi.landedCosts = landedCosts;
   }
+
+  if (sgst !== undefined) pi.sgst = toNumber(sgst);
+  if (cgst !== undefined) pi.cgst = toNumber(cgst);
+  if (igst !== undefined) pi.igst = toNumber(igst);
+  if (gstMode !== undefined) pi.gstMode = gstMode;
+
+  const subtotal = (pi.lines || []).reduce((sum, line = {}) => {
+    const meters =
+      toNumber(line.totalMeters) ||
+      toNumber(line.inwardMeters) ||
+      (toNumber(line.qtyRolls) || 0) * (toNumber(line.lengthMetersPerRoll) || 0);
+    const rate = toNumber(line.ratePerRoll) || 0;
+    return sum + meters * rate;
+  }, 0);
+
+  const taxAmount = toNumber(pi.sgst) + toNumber(pi.cgst) + toNumber(pi.igst);
+  const totalLandedCost = (pi.landedCosts || []).reduce(
+    (sum, cost = {}) => sum + toNumber(cost.amount),
+    0
+  );
+
+  pi.subtotal = subtotal;
+  pi.taxAmount = taxAmount;
+  pi.total = subtotal + taxAmount;
+  pi.totalLandedCost = totalLandedCost;
+  pi.grandTotal = pi.total + totalLandedCost;
 
   await pi.save();
 

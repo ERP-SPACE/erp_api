@@ -3,14 +3,23 @@ const catchAsync = require("../utils/catchAsync");
 
 class PricingController {
   calculatePrice = catchAsync(async (req, res) => {
-    const { customerId, productId, widthInches, quantityRolls, lengthMeters } =
+    const {
+      customerId,
+      customerid,
+      skuId,
+      skuid,
+      productId, // backward-compat alias used by old UI payload
+      quantityRolls,
+      lengthMeters,
+    } =
       req.body;
 
+    const resolvedCustomerId = customerId || customerid;
+    const resolvedSkuId = skuId || skuid || productId;
     const result = await pricingService.calculatePrice(
-      customerId,
-      productId,
-      parseInt(widthInches),
-      parseInt(quantityRolls),
+      resolvedCustomerId,
+      resolvedSkuId,
+      parseInt(quantityRolls, 10),
       lengthMeters ? parseInt(lengthMeters) : undefined
     );
 
@@ -49,12 +58,12 @@ class PricingController {
   });
 
   bulkRevision = catchAsync(async (req, res) => {
-    const { customerId, revisionType, value, productIds } = req.body;
+    const { customerId, revisionType, value, productIds, skuIds } = req.body;
     const updates = await pricingService.bulkRateRevision(
       customerId,
       revisionType,
       parseInt(value),
-      productIds || null
+      skuIds || productIds || null
     );
     res
       .status(200)

@@ -69,6 +69,9 @@ class PricingService {
     return {
       baseRate: ratePerRoll,
       skuId,
+      skuid: skuId,
+      customerId,
+      customerid: customerId,
       quantityRolls,
       ratePerRoll,
       subtotal,
@@ -138,7 +141,10 @@ class PricingService {
       const product = sku?.productId;
       return {
         rateId: rate._id,
+        customerId: rate.customerId,
+        customerid: rate.customerId,
         skuId: sku?._id,
+        skuid: sku?._id,
         skuCode: sku?.skuCode,
         widthInches: sku?.widthInches,
         productName: product?.productAlias || product?.productCode || "",

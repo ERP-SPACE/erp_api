@@ -172,7 +172,14 @@ class CustomerService {
     const rates = await CustomerRate.find({
       customerId: id,
       active: true,
-    }).populate("productId");
+    }).populate({
+      path: "skuId",
+      select: "skuCode skuAlias widthInches productId",
+      populate: {
+        path: "productId",
+        select: "productCode productAlias taxRate",
+      },
+    });
 
     return { customer, rates };
   }
@@ -300,7 +307,7 @@ class CustomerService {
     const outstanding = await SalesInvoice.aggregate([
       {
         $match: {
-          customerId: mongoose.Types.ObjectId(customerId),
+          customerId: new mongoose.Types.ObjectId(customerId),
           status: "Posted",
           paymentStatus: { $ne: "Paid" },
         },
@@ -308,7 +315,20 @@ class CustomerService {
       {
         $group: {
           _id: null,
-          total: { $sum: "$balanceAmount" },
+          total: {
+            $sum: {
+              $cond: [
+                { $gt: ["$outstandingAmount", 0] },
+                "$outstandingAmount",
+                {
+                  $subtract: [
+                    { $ifNull: ["$total", 0] },
+                    { $ifNull: ["$paidAmount", 0] },
+                  ],
+                },
+              ],
+            },
+          },
         },
       },
     ]);
@@ -320,14 +340,14 @@ class CustomerService {
     const pendingOrders = await SalesOrder.aggregate([
       {
         $match: {
-          customerId: mongoose.Types.ObjectId(customerId),
+          customerId: new mongoose.Types.ObjectId(customerId),
           status: { $in: ["Confirmed", "PartiallyFulfilled"] },
         },
       },
       {
         $group: {
           _id: null,
-          total: { $sum: "$pendingAmount" },
+          total: { $sum: "$total" },
         },
       },
     ]);
@@ -365,7 +385,17 @@ class CustomerService {
         customerId: customerId,
         status: "Posted",
         paymentStatus: { $ne: "Paid" },
-        invoiceDate: { $lte: overdueDate },
+        $or: [
+          { dueDate: { $lte: overdueDate } },
+          {
+            dueDate: { $exists: false },
+            siDate: { $lte: overdueDate },
+          },
+          {
+            dueDate: null,
+            siDate: { $lte: overdueDate },
+          },
+        ],
       });
 
       if (overdueInvoices) {
@@ -397,11 +427,20 @@ class CustomerService {
   }
 
   async setCustomerRate(customerId, productId, baseRate44, userId, notes) {
+    const skuId = productId;
+    const baseRate = baseRate44;
+    if (!skuId) {
+      throw new AppError("skuId is required", 400);
+    }
+    if (baseRate === undefined || baseRate === null) {
+      throw new AppError("baseRate is required", 400);
+    }
+
     // Deactivate existing rate
     await CustomerRate.updateMany(
       {
         customerId,
-        productId,
+        skuId,
         active: true,
       },
       {
@@ -413,10 +452,13 @@ class CustomerService {
     // Create new rate
     const rate = await CustomerRate.create({
       customerId,
-      productId,
-      baseRate44,
+      skuId,
+      baseRate,
       approvedBy: userId,
       notes,
+      validFrom: new Date(),
+      validTo: null,
+      active: true,
     });
 
     return rate;
@@ -430,11 +472,20 @@ class CustomerService {
       const results = [];
 
       for (const update of rateUpdates) {
+        const skuId = update.skuId || update.productId;
+        const baseRate = update.baseRate ?? update.baseRate44;
+        if (!skuId) {
+          throw new AppError("Each rate update must include skuId", 400);
+        }
+        if (baseRate === undefined || baseRate === null) {
+          throw new AppError("Each rate update must include baseRate", 400);
+        }
+
         // Deactivate old rate
         await CustomerRate.updateMany(
           {
             customerId,
-            productId: update.productId,
+            skuId,
             active: true,
           },
           {
@@ -449,10 +500,13 @@ class CustomerService {
           [
             {
               customerId,
-              productId: update.productId,
-              baseRate44: update.baseRate44,
+              skuId,
+              baseRate,
               approvedBy: userId,
               notes: update.notes,
+              validFrom: new Date(),
+              validTo: null,
+              active: true,
             },
           ],
           { session }
@@ -474,11 +528,18 @@ class CustomerService {
   async getCustomerRateHistory(customerId, productId = null) {
     const query = { customerId };
     if (productId) {
-      query.productId = productId;
+      query.skuId = productId;
     }
 
     const history = await CustomerRate.find(query)
-      .populate("productId")
+      .populate({
+        path: "skuId",
+        select: "skuCode skuAlias widthInches productId",
+        populate: {
+          path: "productId",
+          select: "productCode productAlias taxRate",
+        },
+      })
       .populate("approvedBy", "name")
       .sort({ createdAt: -1 });
 

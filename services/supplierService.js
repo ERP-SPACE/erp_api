@@ -4,6 +4,25 @@ const RateHistory = require("../models/RateHistory");
 const ContactPerson = require("../models/ContactPerson");
 const AppError = require("../utils/AppError");
 
+const mapBaseRateForUi = (baseRateDoc) => {
+  if (!baseRateDoc) {
+    return baseRateDoc;
+  }
+
+  const rate =
+    typeof baseRateDoc.toObject === "function"
+      ? baseRateDoc.toObject({ virtuals: true })
+      : { ...baseRateDoc };
+
+  return {
+    ...rate,
+    supplierid: rate.supplierId,
+    agentid: rate.agentId,
+    customerid: rate.customerId,
+    skuid: rate.skuId,
+  };
+};
+
 class SupplierService {
   async getNextSupplierCode() {
     const count = await Supplier.countDocuments();
@@ -175,7 +194,7 @@ class SupplierService {
       })
       .sort({ createdAt: -1 });
 
-    return baseRates;
+    return baseRates.map(mapBaseRateForUi);
   }
 
   /**
@@ -200,6 +219,10 @@ class SupplierService {
       // Create history record before updating
       await RateHistory.create({
         baseRateId: baseRate._id,
+        skuId: baseRate.skuId,
+        supplierId: baseRate.supplierId,
+        agentId: baseRate.agentId,
+        customerId: baseRate.customerId,
         previousRate: baseRate.rate,
       });
 
@@ -216,7 +239,7 @@ class SupplierService {
     }
 
     // Re-fetch with populated data
-    return await BaseRate.findById(baseRate._id).populate({
+    const populatedRate = await BaseRate.findById(baseRate._id).populate({
       path: "skuId",
       select: "skuCode skuAlias widthInches productId",
       populate: {
@@ -229,6 +252,8 @@ class SupplierService {
         ],
       },
     });
+
+    return mapBaseRateForUi(populatedRate);
   }
 
   /**
@@ -259,14 +284,23 @@ class SupplierService {
       throw new AppError("Base rate not found for this supplier", 404);
     }
 
-    const history = await RateHistory.find({ baseRateId })
+    const history = await RateHistory.find({ supplierId, baseRateId })
       .populate({
-        path: "baseRateId",
-        select: "rate skuId",
+        path: "skuId",
+        select: "skuCode skuAlias widthInches productId",
+        populate: {
+          path: "productId",
+          select: "productCode productAlias categoryId gsmId qualityId",
+          populate: [
+            { path: "categoryId", select: "name" },
+            { path: "gsmId", select: "name" },
+            { path: "qualityId", select: "name" },
+          ],
+        },
       })
       .sort({ createdAt: -1 });
 
-    return history;
+    return history.map(mapBaseRateForUi);
   }
 
   /**
@@ -278,32 +312,23 @@ class SupplierService {
       throw new AppError("Supplier not found", 404);
     }
 
-    // Get all base rates for this supplier
-    const baseRates = await BaseRate.find({ supplierId }).select("_id");
-    const baseRateIds = baseRates.map((br) => br._id);
-
-    // Get all history for these base rates
-    const history = await RateHistory.find({ baseRateId: { $in: baseRateIds } })
+    const history = await RateHistory.find({ supplierId })
       .populate({
-        path: "baseRateId",
-        select: "rate skuId",
+        path: "skuId",
+        select: "skuCode skuAlias widthInches productId",
         populate: {
-          path: "skuId",
-          select: "skuCode skuAlias widthInches productId",
-          populate: {
-            path: "productId",
-            select: "productCode productAlias categoryId gsmId qualityId",
-            populate: [
-              { path: "categoryId", select: "name" },
-              { path: "gsmId", select: "name" },
-              { path: "qualityId", select: "name" },
-            ],
-          },
+          path: "productId",
+          select: "productCode productAlias categoryId gsmId qualityId",
+          populate: [
+            { path: "categoryId", select: "name" },
+            { path: "gsmId", select: "name" },
+            { path: "qualityId", select: "name" },
+          ],
         },
       })
       .sort({ createdAt: -1 });
 
-    return history;
+    return history.map(mapBaseRateForUi);
   }
 
   /**

@@ -503,7 +503,11 @@ class RollService {
           },
           totalRolls: { $sum: 1 },
           totalMeters: { $sum: "$currentLengthMeters" },
-          totalValue: { $sum: "$totalLandedCost" },
+          totalValue: { 
+            $sum: { 
+              $multiply: ["$landedCostPerMeter", "$currentLengthMeters"] 
+            } 
+          },
         },
       },
       {

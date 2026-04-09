@@ -1,5 +1,7 @@
 const mongoose = require("mongoose");
 const Agent = require("../models/Agent");
+const BaseRate = require("../models/BaseRate");
+const RateHistory = require("../models/RateHistory");
 require("../models/User");
 const AppError = require("../utils/AppError");
 
@@ -11,6 +13,11 @@ const COMMISSION_METHODS = {
 const POPULATE_OPTIONS = [
   { path: "customers", select: "name customerCode phone email" },
   {
+    path: "defaultSkuRates.sku",
+    select: "skuCode skuAlias widthInches productId",
+    populate: { path: "productId", select: "productCode productAlias" },
+  },
+  {
     path: "partyCommissions.customer",
     select: "name customerCode phone email",
   },
@@ -18,6 +25,87 @@ const POPULATE_OPTIONS = [
   { path: "commissionChanges.customer", select: "name customerCode" },
   { path: "commissionChanges.changedBy", select: "name email" },
 ];
+
+const normalizeRateEntry = (rate = {}) => {
+  if (!rate || typeof rate !== "object") {
+    return rate;
+  }
+
+  const skuId = rate.skuId || rate.skuid || rate.sku;
+
+  return {
+    ...rate,
+    ...(skuId ? { sku: skuId } : {}),
+  };
+};
+
+const normalizeDefaultSkuRates = (rates) => {
+  if (!Array.isArray(rates)) {
+    return rates;
+  }
+
+  return rates
+    .map(normalizeRateEntry)
+    .filter((rate) => rate && rate.sku);
+};
+
+const mapDefaultSkuRateForUi = (agentId, rate = {}) => {
+  const sourceSku = rate.skuId || rate.skuid || rate.sku || null;
+  const skuId =
+    sourceSku && typeof sourceSku === "object" && sourceSku._id
+      ? sourceSku._id
+      : sourceSku;
+
+  return {
+    ...rate,
+    agentId,
+    agentid: agentId,
+    skuId,
+    skuid: skuId,
+    sku: sourceSku,
+  };
+};
+
+const mapAgentForUi = (agentDoc) => {
+  if (!agentDoc) {
+    return agentDoc;
+  }
+
+  const agent =
+    typeof agentDoc.toObject === "function"
+      ? agentDoc.toObject({ virtuals: true })
+      : { ...agentDoc };
+
+  const agentId = agent._id;
+
+  return {
+    ...agent,
+    agentId,
+    agentid: agentId,
+    defaultSkuRates: Array.isArray(agent.defaultSkuRates)
+      ? agent.defaultSkuRates.map((rate) => mapDefaultSkuRateForUi(agentId, rate))
+      : [],
+  };
+};
+
+const mapAgentRateHistoryForUi = (historyDoc) => {
+  if (!historyDoc) {
+    return historyDoc;
+  }
+
+  const history =
+    typeof historyDoc.toObject === "function"
+      ? historyDoc.toObject({ virtuals: true })
+      : { ...historyDoc };
+
+  return {
+    ...history,
+    agentid: history.agentId,
+    customerid: history.customerId,
+    supplierid: history.supplierId,
+    skuid: history.skuId,
+  };
+};
 
 const normalizeCommissionPayload = (commission) => {
   if (!commission) {
@@ -151,6 +239,94 @@ const populateAgentDoc = async (doc) => {
   return doc;
 };
 
+const syncAgentDefaultSkuRates = async (agentId, previousRates = [], nextRates = []) => {
+  if (!agentId || !mongoose.Types.ObjectId.isValid(agentId)) {
+    throw new AppError("Invalid agent id", 400);
+  }
+
+  const normalizedNextRates = normalizeDefaultSkuRates(nextRates) || [];
+  const existingBaseRates = await BaseRate.find({ agentId });
+
+  const baseRateBySku = new Map(
+    existingBaseRates.map((baseRate) => [baseRate.skuId.toString(), baseRate])
+  );
+  const previousRateBySku = new Map(
+    (previousRates || [])
+      .map((rate) => normalizeRateEntry(rate))
+      .filter((rate) => rate?.sku)
+      .map((rate) => [normalizeAgentId(rate.sku), rate])
+  );
+
+  const nextSkuIds = new Set();
+
+  for (const rateEntry of normalizedNextRates) {
+    const skuId = normalizeAgentId(rateEntry.sku);
+    if (!skuId || !mongoose.Types.ObjectId.isValid(skuId)) {
+      throw new AppError("Invalid SKU id in defaultSkuRates", 400);
+    }
+
+    nextSkuIds.add(skuId);
+
+    const nextRateValue = Number(rateEntry.rate);
+    const existingBaseRate = baseRateBySku.get(skuId);
+    const previousEmbeddedRate = previousRateBySku.get(skuId);
+
+    if (existingBaseRate) {
+      const currentRateValue = Number(existingBaseRate.rate);
+      if (currentRateValue !== nextRateValue) {
+        await RateHistory.create({
+          baseRateId: existingBaseRate._id,
+          skuId: existingBaseRate.skuId,
+          supplierId: existingBaseRate.supplierId,
+          agentId: existingBaseRate.agentId,
+          customerId: existingBaseRate.customerId,
+          previousRate: existingBaseRate.rate,
+        });
+
+        existingBaseRate.rate = nextRateValue;
+        await existingBaseRate.save();
+      }
+      continue;
+    }
+
+    const createdBaseRate = await BaseRate.create({
+      agentId,
+      skuId,
+      rate: nextRateValue,
+    });
+
+    const previousRateValue =
+      previousEmbeddedRate?.rate !== undefined &&
+      previousEmbeddedRate?.rate !== null
+        ? Number(previousEmbeddedRate.rate)
+        : null;
+
+    if (
+      previousRateValue !== null &&
+      !Number.isNaN(previousRateValue) &&
+      previousRateValue !== nextRateValue
+    ) {
+      await RateHistory.create({
+        baseRateId: createdBaseRate._id,
+        skuId: createdBaseRate.skuId,
+        supplierId: createdBaseRate.supplierId,
+        agentId: createdBaseRate.agentId,
+        customerId: createdBaseRate.customerId,
+        previousRate: previousRateValue,
+      });
+    }
+  }
+
+  const removedBaseRateIds = existingBaseRates
+    .filter((baseRate) => !nextSkuIds.has(baseRate.skuId.toString()))
+    .map((baseRate) => baseRate._id);
+
+  if (removedBaseRateIds.length > 0) {
+    await RateHistory.deleteMany({ baseRateId: { $in: removedBaseRateIds } });
+    await BaseRate.deleteMany({ _id: { $in: removedBaseRateIds } });
+  }
+};
+
 class AgentService {
   async createAgent(data) {
     if (!data.name) {
@@ -174,6 +350,9 @@ class AgentService {
     }
 
     const payload = { ...data };
+    if (Object.prototype.hasOwnProperty.call(payload, "defaultSkuRates")) {
+      payload.defaultSkuRates = normalizeDefaultSkuRates(payload.defaultSkuRates);
+    }
 
     if (payload.partyCommissions && payload.partyCommissions.length > 0) {
       payload.partyCommissions = payload.partyCommissions.map((commission) => {
@@ -191,8 +370,11 @@ class AgentService {
     }
 
     const agent = await Agent.create(payload);
+    if (Object.prototype.hasOwnProperty.call(payload, "defaultSkuRates")) {
+      await syncAgentDefaultSkuRates(agent._id, [], payload.defaultSkuRates);
+    }
     await populateAgentDoc(agent);
-    return agent;
+    return mapAgentForUi(agent);
   }
 
   async getAgents(filters = {}, pagination = {}) {
@@ -239,7 +421,7 @@ class AgentService {
     ]);
 
     return {
-      agents,
+      agents: agents.map(mapAgentForUi),
       pagination: {
         page,
         limit,
@@ -262,7 +444,7 @@ class AgentService {
       throw new AppError("Agent not found", 404);
     }
 
-    return agent;
+    return mapAgentForUi(agent);
   }
 
   async getAgentByCode(code) {
@@ -278,7 +460,7 @@ class AgentService {
       throw new AppError("Agent not found", 404);
     }
 
-    return agent;
+    return mapAgentForUi(agent);
   }
 
   async updateAgent(id, updateData) {
@@ -290,6 +472,21 @@ class AgentService {
 
     const immutableFields = ["agentCode", "customers"];
     immutableFields.forEach((field) => delete updateData[field]);
+    if (Object.prototype.hasOwnProperty.call(updateData, "defaultSkuRates")) {
+      updateData.defaultSkuRates = normalizeDefaultSkuRates(updateData.defaultSkuRates);
+    }
+
+    const existingAgent = await Agent.findById(normalizedId);
+
+    if (!existingAgent) {
+      throw new AppError("Agent not found", 404);
+    }
+
+    const previousDefaultSkuRates = Array.isArray(existingAgent.defaultSkuRates)
+      ? existingAgent.defaultSkuRates.map((rate) =>
+          typeof rate.toObject === "function" ? rate.toObject() : { ...rate }
+        )
+      : [];
 
     const agent = await populateAgentQuery(
       Agent.findByIdAndUpdate(normalizedId, updateData, {
@@ -302,7 +499,15 @@ class AgentService {
       throw new AppError("Agent not found", 404);
     }
 
-    return agent;
+    if (Object.prototype.hasOwnProperty.call(updateData, "defaultSkuRates")) {
+      await syncAgentDefaultSkuRates(
+        normalizedId,
+        previousDefaultSkuRates,
+        updateData.defaultSkuRates
+      );
+    }
+
+    return mapAgentForUi(agent);
   }
 
   async toggleAgentStatus(id) {
@@ -321,7 +526,44 @@ class AgentService {
     agent.active = !agent.active;
     await agent.save();
 
-    return populateAgentDoc(agent);
+    return mapAgentForUi(await populateAgentDoc(agent));
+  }
+
+  async getAgentRateHistory(agentId, filters = {}) {
+    const normalizedAgentId = normalizeAgentId(agentId);
+
+    if (!normalizedAgentId || !mongoose.Types.ObjectId.isValid(normalizedAgentId)) {
+      throw new AppError("Invalid agent id", 400);
+    }
+
+    const agent = await Agent.findById(normalizedAgentId);
+    if (!agent) {
+      throw new AppError("Agent not found", 404);
+    }
+
+    const query = { agentId: normalizedAgentId };
+    if (filters.skuId || filters.skuid) {
+      query.skuId = filters.skuId || filters.skuid;
+    }
+
+    const history = await RateHistory.find(query)
+      .populate({
+        path: "skuId",
+        select: "skuCode skuAlias widthInches productId",
+        populate: {
+          path: "productId",
+          select: "productCode productAlias categoryId gsmId qualityId",
+          populate: [
+            { path: "categoryId", select: "name" },
+            { path: "gsmId", select: "name" },
+            { path: "qualityId", select: "name" },
+          ],
+        },
+      })
+      .sort({ createdAt: -1 })
+      .limit(parseInt(filters.limit, 10) || 50);
+
+    return history.map(mapAgentRateHistoryForUi);
   }
 
   async upsertPartyCommission(agentId, commissionData, options = {}) {
@@ -413,7 +655,7 @@ class AgentService {
 
     await agent.save();
 
-    return populateAgentQuery(Agent.findById(agent._id));
+    return mapAgentForUi(await populateAgentQuery(Agent.findById(agent._id)));
   }
 
   async removePartyCommission(agentId, customerId, options = {}) {
@@ -463,7 +705,7 @@ class AgentService {
 
     await agent.save();
 
-    return populateAgentQuery(Agent.findById(agent._id));
+    return mapAgentForUi(await populateAgentQuery(Agent.findById(agent._id)));
   }
 
   async addCommissionPayout(agentId, payoutData) {
@@ -501,7 +743,7 @@ class AgentService {
 
     await agent.save();
 
-    return populateAgentQuery(Agent.findById(agent._id));
+    return mapAgentForUi(await populateAgentQuery(Agent.findById(agent._id)));
   }
 
   async updateCommissionPayout(agentId, payoutId, updateData = {}) {
@@ -543,7 +785,7 @@ class AgentService {
     agent.markModified("commissionPayouts");
     await agent.save();
 
-    return populateAgentQuery(Agent.findById(agent._id));
+    return mapAgentForUi(await populateAgentQuery(Agent.findById(agent._id)));
   }
 
   async addKycDocument(agentId, documentData) {
@@ -575,7 +817,7 @@ class AgentService {
     agent.markModified("kycDocuments");
     await agent.save();
 
-    return populateAgentQuery(Agent.findById(agent._id));
+    return mapAgentForUi(await populateAgentQuery(Agent.findById(agent._id)));
   }
 
   async removeKycDocument(agentId, documentId) {
@@ -609,7 +851,7 @@ class AgentService {
     agent.markModified("kycDocuments");
     await agent.save();
 
-    return populateAgentQuery(Agent.findById(agent._id));
+    return mapAgentForUi(await populateAgentQuery(Agent.findById(agent._id)));
   }
 }
 

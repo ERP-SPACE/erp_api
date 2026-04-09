@@ -67,6 +67,19 @@ class AgentController {
     });
   });
 
+  getAgentRateHistory = catchAsync(async (req, res) => {
+    const history = await agentService.getAgentRateHistory(
+      req.params.id,
+      req.query
+    );
+
+    res.status(200).json({
+      success: true,
+      count: history.length,
+      data: history,
+    });
+  });
+
   updateAgent = catchAsync(async (req, res) => {
     const agent = await agentService.updateAgent(req.params.id, req.body);
 

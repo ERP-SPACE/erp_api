@@ -220,6 +220,26 @@ const commissionChangeSchema = new mongoose.Schema(
   }
 );
 
+const defaultSkuRateSchema = new mongoose.Schema(
+  {
+    sku: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SKU",
+      required: true,
+    },
+    rate: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+    notes: String,
+  },
+  {
+    _id: false,
+    timestamps: true,
+  }
+);
+
 const agentSchema = new mongoose.Schema(
   {
     agentCode: {
@@ -312,6 +332,7 @@ const agentSchema = new mongoose.Schema(
     partyCommissions: [partyCommissionSchema],
     commissionChanges: [commissionChangeSchema],
     commissionPayouts: [commissionPayoutSchema],
+    defaultSkuRates: [defaultSkuRateSchema],
   },
   {
     timestamps: true,
@@ -329,6 +350,7 @@ agentSchema.index({ name: "text", companyName: "text" });
 agentSchema.index({ "partyCommissions.customer": 1 });
 agentSchema.index({ "commissionPayouts.payoutStatus": 1 });
 agentSchema.index({ blockNewSalesForAllParties: 1 });
+agentSchema.index({ "defaultSkuRates.sku": 1 });
 
 // Generate agent code
 agentSchema.pre("save", async function (next) {

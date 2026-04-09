@@ -23,7 +23,7 @@ const sanitizeUser = (user) => {
   return obj;
 };
 
-// Register new user (default Admin) — requires full address per model
+// Register new user (default SalesExec) — requires full address per model
 const register = handleAsyncErrors(async (req, res) => {
   if (!JWT_SECRET) {
     throw new AppError("Server misconfigured: JWT secret missing", 500);

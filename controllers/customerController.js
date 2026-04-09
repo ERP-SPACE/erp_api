@@ -95,6 +95,38 @@ const sanitizeCreditPolicy = (creditPolicy) => {
   };
 };
 
+const sanitizeContactPersons = (contactPersons) => {
+  if (!Array.isArray(contactPersons)) return [];
+
+  const trimmed = contactPersons.map((person = {}) => ({
+    ...person,
+    name: typeof person.name === "string" ? person.name.trim() : "",
+    phone: typeof person.phone === "string" ? person.phone.trim() : "",
+    designation:
+      typeof person.designation === "string" ? person.designation.trim() : "",
+    whatsapp:
+      typeof person.whatsapp === "string" ? person.whatsapp.trim() : "",
+    email: typeof person.email === "string" ? person.email.trim() : "",
+  }));
+
+  const nonEmpty = trimmed.filter(
+    (person) =>
+      person.name ||
+      person.phone ||
+      person.designation ||
+      person.whatsapp ||
+      person.email
+  );
+
+  if (!nonEmpty.length) return [];
+
+  if (!nonEmpty.some((person) => person.isPrimary)) {
+    nonEmpty[0].isPrimary = true;
+  }
+
+  return nonEmpty;
+};
+
 const normalizeCustomerGroupIds = (groupIds, fallback) => {
   let ids = [];
 
@@ -192,6 +224,19 @@ const customerRelationsPopulate = [
   { path: "agentId", select: "name agentCode phone" },
 ];
 
+const mapCustomerRateForUi = (rateDoc) => {
+  if (!rateDoc) return rateDoc;
+
+  const rate =
+    typeof rateDoc.toObject === "function" ? rateDoc.toObject() : { ...rateDoc };
+
+  return {
+    ...rate,
+    customerid: rate.customerId,
+    skuid: rate.skuId,
+  };
+};
+
 // Create customer
 const createCustomer = handleAsyncErrors(async (req, res) => {
   const {
@@ -236,6 +281,7 @@ const createCustomer = handleAsyncErrors(async (req, res) => {
   // Sanitize numeric fields
   const sanitizedCreditPolicy = sanitizeCreditPolicy(creditPolicy);
   const sanitizedBaseRate44 = sanitizeNumericValue(baseRate44);
+  const sanitizedContactPersons = sanitizeContactPersons(contactPersons);
   const sanitizedBusinessInfo = businessInfo ? {
     ...businessInfo,
     targetSalesMeters: sanitizeNumericValue(businessInfo.targetSalesMeters),
@@ -252,7 +298,7 @@ const createCustomer = handleAsyncErrors(async (req, res) => {
     customerGroupId: normalizedGroups[0],
     customerGroupIds: normalizedGroups,
     agentId: normalizedAgentId,
-    contactPersons,
+    contactPersons: sanitizedContactPersons,
     referral: referralSource,
     creditPolicy: sanitizedCreditPolicy,
     baseRate44: sanitizedBaseRate44,
@@ -327,6 +373,10 @@ const updateCustomer = handleAsyncErrors(async (req, res) => {
   if (updateData.creditPolicy) {
     updateData.creditPolicy = sanitizeCreditPolicy(updateData.creditPolicy);
   }
+
+  if (Object.prototype.hasOwnProperty.call(updateData, "contactPersons")) {
+    updateData.contactPersons = sanitizeContactPersons(updateData.contactPersons);
+  }
   
   if (updateData.baseRate44 !== undefined) {
     updateData.baseRate44 = sanitizeNumericValue(updateData.baseRate44);
@@ -379,20 +429,45 @@ const checkCredit = handleAsyncErrors(async (req, res) => {
   const blockReason = customer.creditPolicy?.blockReason || null;
   const creditLimit = Number(customer.creditPolicy?.creditLimit) || 0;
 
-  // Calculate pending SO value (Confirmed or InProgress)
-  const SalesOrder = require("../models/SalesOrder");
+  // Calculate pending SO value (Confirmed or PartiallyFulfilled)
   const pendingSOAgg = await SalesOrder.aggregate([
     {
       $match: {
         customerId: customer._id,
-        status: { $in: ["Confirmed", "InProgress"] },
+        status: { $in: ["Confirmed", "PartiallyFulfilled"] },
       },
     },
     { $group: { _id: null, total: { $sum: "$total" } } },
   ]);
   const pendingSOValue = pendingSOAgg[0]?.total || 0;
 
-  const exposure = pendingSOValue;
+  // Outstanding AR from posted invoices not fully paid
+  const outstandingAgg = await SalesInvoice.aggregate([
+    {
+      $match: {
+        customerId: customer._id,
+        status: "Posted",
+        paymentStatus: { $ne: "Paid" },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        total: {
+          $sum: {
+            $cond: [
+              { $gt: ["$outstandingAmount", 0] },
+              "$outstandingAmount",
+              { $subtract: [{ $ifNull: ["$total", 0] }, { $ifNull: ["$paidAmount", 0] }] },
+            ],
+          },
+        },
+      },
+    },
+  ]);
+  const outstandingAR = outstandingAgg[0]?.total || 0;
+
+  const exposure = pendingSOValue + outstandingAR;
   const availableCredit = Math.max(0, creditLimit - exposure);
   const overLimit = creditLimit > 0 && exposure > creditLimit;
 
@@ -402,7 +477,7 @@ const checkCredit = handleAsyncErrors(async (req, res) => {
     creditLimit,
     exposure,
     pendingSOValue,
-    outstandingAR: 0, // Will be populated when AR/invoicing is implemented
+    outstandingAR,
     availableCredit,
     overLimit,
   };
@@ -486,32 +561,47 @@ const getCustomerRates = handleAsyncErrors(async (req, res) => {
       populate: { path: "productId", select: "productCode productAlias" } })
     .sort({ createdAt: -1 });
 
-  res.json({ success: true, count: rates.length, data: rates });
+  res.json({
+    success: true,
+    count: rates.length,
+    data: rates.map(mapCustomerRateForUi),
+  });
 });
 
 // Set (create or replace) a SKU rate for a customer
 const setCustomerRate = handleAsyncErrors(async (req, res) => {
   const { id } = req.params;
-  const { skuId, baseRate, notes, isSpecialRate, specialRateReason } = req.body;
+  const {
+    skuId,
+    skuid,
+    baseRate,
+    rate: incomingRate,
+    notes,
+    isSpecialRate,
+    specialRateReason,
+  } = req.body;
+  const resolvedSkuId = skuId || skuid;
+  const resolvedBaseRate =
+    baseRate !== undefined && baseRate !== null ? baseRate : incomingRate;
 
-  if (!skuId)
+  if (!resolvedSkuId)
     throw new AppError("SKU is required", 400, "VALIDATION_ERROR");
-  if (baseRate === undefined || baseRate === null)
+  if (resolvedBaseRate === undefined || resolvedBaseRate === null)
     throw new AppError("Rate is required", 400, "VALIDATION_ERROR");
 
-  const numericRate = sanitizeNumericValue(baseRate);
+  const numericRate = sanitizeNumericValue(resolvedBaseRate);
   if (numericRate < 0)
     throw new AppError("Rate must be non-negative", 400, "VALIDATION_ERROR");
 
   // Expire any currently active rate for this customer+SKU
   await CustomerRate.updateMany(
-    { customerId: id, skuId, active: true, validTo: null },
+    { customerId: id, skuId: resolvedSkuId, active: true, validTo: null },
     { $set: { active: false, validTo: new Date() } }
   );
 
-  const rate = await CustomerRate.create({
+  const createdRate = await CustomerRate.create({
     customerId: id,
-    skuId,
+    skuId: resolvedSkuId,
     baseRate: numericRate,
     validFrom: new Date(),
     validTo: null,
@@ -522,10 +612,10 @@ const setCustomerRate = handleAsyncErrors(async (req, res) => {
     approvedBy: req.user?._id,
   });
 
-  await rate.populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
+  await createdRate.populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
     populate: { path: "productId", select: "productCode productAlias" } });
 
-  res.status(201).json({ success: true, data: rate });
+  res.status(201).json({ success: true, data: mapCustomerRateForUi(createdRate) });
 });
 
 // Deactivate a SKU rate for a customer
@@ -551,10 +641,10 @@ const deleteCustomerRate = handleAsyncErrors(async (req, res) => {
 // Get full rate history for a customer (optionally filtered by SKU)
 const getRateHistory = handleAsyncErrors(async (req, res) => {
   const { id } = req.params;
-  const { skuId, limit } = req.query;
+  const { skuId, skuid, limit } = req.query;
 
   const query = { customerId: id };
-  if (skuId) query.skuId = skuId;
+  if (skuId || skuid) query.skuId = skuId || skuid;
 
   const history = await CustomerRate.find(query)
     .populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
@@ -563,7 +653,11 @@ const getRateHistory = handleAsyncErrors(async (req, res) => {
     .sort({ createdAt: -1 })
     .limit(parseInt(limit) || 50);
 
-  res.json({ success: true, count: history.length, data: history });
+  res.json({
+    success: true,
+    count: history.length,
+    data: history.map(mapCustomerRateForUi),
+  });
 });
 
 // Bulk update rates for a customer (percentage or flat revision across all SKUs)
@@ -578,28 +672,40 @@ const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
   const results = { updated: [], failed: [] };
 
   for (const update of rateUpdates) {
-    const { skuId, baseRate, notes, isSpecialRate, specialRateReason } = update;
-    if (!skuId || baseRate === undefined || baseRate === null) {
-      results.failed.push({ skuId, reason: "skuId and baseRate are required" });
+    const resolvedSkuId = update.skuId || update.skuid;
+    const resolvedBaseRate =
+      update.baseRate !== undefined && update.baseRate !== null
+        ? update.baseRate
+        : update.rate;
+    const { notes, isSpecialRate, specialRateReason } = update;
+
+    if (!resolvedSkuId || resolvedBaseRate === undefined || resolvedBaseRate === null) {
+      results.failed.push({
+        skuId: resolvedSkuId,
+        reason: "skuId and baseRate are required",
+      });
       continue;
     }
 
-    const numericRate = sanitizeNumericValue(baseRate);
+    const numericRate = sanitizeNumericValue(resolvedBaseRate);
     if (numericRate < 0) {
-      results.failed.push({ skuId, reason: "Rate must be non-negative" });
+      results.failed.push({
+        skuId: resolvedSkuId,
+        reason: "Rate must be non-negative",
+      });
       continue;
     }
 
     try {
       // Expire existing active rate
       await CustomerRate.updateMany(
-        { customerId: id, skuId, active: true, validTo: null },
+        { customerId: id, skuId: resolvedSkuId, active: true, validTo: null },
         { $set: { active: false, validTo: new Date() } }
       );
 
       const rate = await CustomerRate.create({
         customerId: id,
-        skuId,
+        skuId: resolvedSkuId,
         baseRate: numericRate,
         validFrom: new Date(),
         validTo: null,
@@ -610,9 +716,13 @@ const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
         approvedBy: req.user?._id,
       });
 
-      results.updated.push({ skuId, rateId: rate._id, baseRate: numericRate });
+      results.updated.push({
+        ...mapCustomerRateForUi(rate),
+        rateId: rate._id,
+        baseRate: numericRate,
+      });
     } catch (err) {
-      results.failed.push({ skuId, reason: err.message });
+      results.failed.push({ skuId: resolvedSkuId, reason: err.message });
     }
   }
 

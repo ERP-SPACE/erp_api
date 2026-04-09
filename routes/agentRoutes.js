@@ -12,6 +12,7 @@ router
   .get(agentController.getAgents);
 
 router.get("/code/:code", agentController.getAgentByCode);
+router.get("/:id/rate-history", agentController.getAgentRateHistory);
 
 router
   .route("/:id")

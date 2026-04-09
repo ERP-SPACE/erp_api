@@ -47,9 +47,9 @@ const customerSchema = new mongoose.Schema(
     },
     contactPersons: [
       {
-        name: { type: String, required: true },
+        name: { type: String },
         designation: String,
-        phone: { type: String, required: true },
+        phone: { type: String },
         whatsapp: String,
         email: { type: String, lowercase: true },
         isPrimary: { type: Boolean, default: false },

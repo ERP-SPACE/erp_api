@@ -8,7 +8,6 @@ const contactPersonSchema = new mongoose.Schema(
     },
     contactPersonName: {
       type: String,
-      required: [true, "Contact person name is required"],
       trim: true,
     },
     contactPersonEmail: {
@@ -18,7 +17,6 @@ const contactPersonSchema = new mongoose.Schema(
     },
     contactPersonPhone: {
       type: Number,
-      required: [true, "Contact person phone is required"],
     },
     isPrimary: {
       type: Boolean,
