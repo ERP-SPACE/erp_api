@@ -11,10 +11,10 @@ const rateHistorySchema = new mongoose.Schema(
       ref: "BaseRate",
       required: [true, "Base rate is required"],
     },
-    skuId: {
+    productId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "SKU",
-      required: [true, "SKU is required"],
+      ref: "Product",
+      required: [true, "Product is required"],
     },
     supplierId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -46,13 +46,13 @@ const rateHistorySchema = new mongoose.Schema(
 // Indexes
 rateHistorySchema.index({ rateHistoryId: 1 });
 rateHistorySchema.index({ baseRateId: 1 });
-rateHistorySchema.index({ skuId: 1 });
+rateHistorySchema.index({ productId: 1 });
 rateHistorySchema.index({ supplierId: 1, createdAt: -1 });
 rateHistorySchema.index({ agentId: 1, createdAt: -1 });
 rateHistorySchema.index({ customerId: 1, createdAt: -1 });
-rateHistorySchema.index({ supplierId: 1, skuId: 1, createdAt: -1 });
-rateHistorySchema.index({ agentId: 1, skuId: 1, createdAt: -1 });
-rateHistorySchema.index({ customerId: 1, skuId: 1, createdAt: -1 });
+rateHistorySchema.index({ supplierId: 1, productId: 1, createdAt: -1 });
+rateHistorySchema.index({ agentId: 1, productId: 1, createdAt: -1 });
+rateHistorySchema.index({ customerId: 1, productId: 1, createdAt: -1 });
 
 rateHistorySchema.pre("validate", function (next) {
   const hasSupplier = !!this.supplierId;
@@ -101,9 +101,9 @@ rateHistorySchema.virtual("baseRate", {
   justOne: true,
 });
 
-rateHistorySchema.virtual("sku", {
-  ref: "SKU",
-  localField: "skuId",
+rateHistorySchema.virtual("product", {
+  ref: "Product",
+  localField: "productId",
   foreignField: "_id",
   justOne: true,
 });

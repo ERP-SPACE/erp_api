@@ -1,5 +1,6 @@
 const SalesOrder = require("../models/SalesOrder");
 const Customer = require("../models/Customer");
+const BaseRate = require("../models/BaseRate");
 const SKU = require("../models/SKU");
 const numberingService = require("../services/numberingService");
 const pricingService = require("../services/pricingService");
@@ -85,6 +86,47 @@ async function buildProcessedLine(line, sku, lineTotal, lineTax = 0, runAllocati
   };
 }
 
+async function getBenchmarkSkuForSalesSku(sku) {
+  if (!sku?.productId) {
+    return sku;
+  }
+
+  const productId = sku.productId._id || sku.productId;
+  if (!productId) {
+    return sku;
+  }
+
+  return (
+    await SKU.findOne({ productId, widthInches: 44 }).select(
+      "_id widthInches productId"
+    )
+  ) || sku;
+}
+
+async function getBenchmarkRate44ForCustomer(customerId, sku, _pricingDate = new Date()) {
+  const benchmarkSku = await getBenchmarkSkuForSalesSku(sku);
+  const productId = benchmarkSku.productId?._id || benchmarkSku.productId;
+  if (!productId) {
+    throw new AppError(
+      `No product on benchmark SKU for ${sku.skuCode || sku._id}`,
+      400,
+      "RATE_NOT_FOUND"
+    );
+  }
+
+  const benchmarkRate = await BaseRate.findOne({ customerId, productId });
+
+  if (!benchmarkRate) {
+    throw new AppError(
+      `No active 44" benchmark rate found for SKU ${sku.skuCode || sku._id}`,
+      400,
+      "RATE_NOT_FOUND"
+    );
+  }
+
+  return Number(benchmarkRate.rate) || 0;
+}
+
 // ─── Controllers ────────────────────────────────────────────────────────────
 
 // Get all sales orders
@@ -141,7 +183,7 @@ const getSalesOrder = handleAsyncErrors(async (req, res) => {
   const salesOrder = await SalesOrder.findById(req.params.id)
     .populate({
       path: "customerId",
-      select: "companyName customerCode creditPolicy baseRate44",
+      select: "companyName customerCode creditPolicy",
       populate: { path: "customerGroupId", select: "name code" },
     })
     .populate({
@@ -204,8 +246,13 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
       throw new AppError(`SKU not found: ${line.skuId}`, 404, "RESOURCE_NOT_FOUND");
     }
 
+    const benchmarkRate44 = await getBenchmarkRate44ForCustomer(
+      customerId,
+      sku,
+      date ? new Date(date) : new Date()
+    );
     const pricing = pricingService.calculateSalesPricing(
-      customer.baseRate44,
+      benchmarkRate44,
       sku.widthInches,
       line.lengthMetersPerRoll,
       line.qtyRolls,
@@ -310,8 +357,13 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
       throw new AppError(`SKU not found: ${line.skuId}`, 404, "RESOURCE_NOT_FOUND");
     }
 
+    const benchmarkRate44 = await getBenchmarkRate44ForCustomer(
+      customerId,
+      sku,
+      date ? new Date(date) : new Date()
+    );
     const pricing = pricingService.calculateSalesPricing(
-      customer.baseRate44,
+      benchmarkRate44,
       sku.widthInches,
       line.lengthMetersPerRoll,
       line.qtyRolls,
@@ -549,8 +601,9 @@ const calculatePricing = handleAsyncErrors(async (req, res) => {
       throw new AppError(`SKU not found: ${line.skuId}`, 404, "RESOURCE_NOT_FOUND");
     }
 
+    const benchmarkRate44 = await getBenchmarkRate44ForCustomer(customerId, sku);
     const pricing = pricingService.calculateSalesPricing(
-      customer.baseRate44,
+      benchmarkRate44,
       sku.widthInches,
       line.lengthMetersPerRoll,
       line.qtyRolls,
@@ -565,7 +618,6 @@ const calculatePricing = handleAsyncErrors(async (req, res) => {
   res.json({
     success: true,
     data: {
-      customerBaseRate44: customer.baseRate44,
       lines: processedLines,
     },
   });

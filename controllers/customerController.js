@@ -2,7 +2,9 @@ const mongoose = require("mongoose");
 const Customer = require("../models/Customer");
 const SalesInvoice = require("../models/SalesInvoice");
 const SalesOrder = require("../models/SalesOrder");
-const CustomerRate = require("../models/CustomerRate");
+const BaseRate = require("../models/BaseRate");
+const RateHistory = require("../models/RateHistory");
+const customerService = require("../services/customerService");
 const Agent = require("../models/Agent");
 const numberingService = require("../services/numberingService");
 const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
@@ -47,6 +49,276 @@ const getCustomer = handleAsyncErrors(async (req, res) => {
     success: true,
     data: customer,
   });
+});
+
+// Sales summary for a customer (for detail view dashboards)
+const getCustomerSalesSummary = handleAsyncErrors(async (req, res) => {
+  const customerId = req.params.id;
+  const now = new Date();
+
+  if (!mongoose.Types.ObjectId.isValid(customerId)) {
+    throw new AppError("Invalid customer id", 400, "INVALID_CUSTOMER");
+  }
+
+  const customer = await Customer.findById(customerId).select("_id");
+  if (!customer) {
+    throw new AppError("Customer not found", 404, "RESOURCE_NOT_FOUND");
+  }
+
+  const [agg] = await SalesInvoice.aggregate([
+    {
+      $match: {
+        customerId: customer._id,
+        status: "Posted",
+      },
+    },
+    {
+      $facet: {
+        totals: [
+          {
+            $group: {
+              _id: null,
+              totalAmount: { $sum: { $ifNull: ["$total", 0] } },
+            },
+          },
+        ],
+        meters: [
+          { $unwind: { path: "$lines", preserveNullAndEmptyArrays: true } },
+          {
+            $group: {
+              _id: null,
+              totalSalesMeters: {
+                $sum: { $ifNull: ["$lines.billedLengthMeters", 0] },
+              },
+            },
+          },
+        ],
+        outstanding: [
+          {
+            $match: {
+              paymentStatus: { $ne: "Paid" },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              outstanding: {
+                $sum: {
+                  $cond: [
+                    { $gt: ["$outstandingAmount", 0] },
+                    "$outstandingAmount",
+                    {
+                      $subtract: [
+                        { $ifNull: ["$total", 0] },
+                        { $ifNull: ["$paidAmount", 0] },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        outstandingDue: [
+          {
+            $match: {
+              paymentStatus: { $ne: "Paid" },
+              dueDate: { $lte: now },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              outstandingDue: {
+                $sum: {
+                  $cond: [
+                    { $gt: ["$outstandingAmount", 0] },
+                    "$outstandingAmount",
+                    {
+                      $subtract: [
+                        { $ifNull: ["$total", 0] },
+                        { $ifNull: ["$paidAmount", 0] },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+    {
+      $project: {
+        totalAmount: {
+          $ifNull: [{ $arrayElemAt: ["$totals.totalAmount", 0] }, 0],
+        },
+        totalSalesMeters: {
+          $ifNull: [{ $arrayElemAt: ["$meters.totalSalesMeters", 0] }, 0],
+        },
+        outstanding: {
+          $ifNull: [{ $arrayElemAt: ["$outstanding.outstanding", 0] }, 0],
+        },
+        outstandingDue: {
+          $ifNull: [
+            { $arrayElemAt: ["$outstandingDue.outstandingDue", 0] },
+            0,
+          ],
+        },
+      },
+    },
+  ]);
+
+  res.json({
+    success: true,
+    data: {
+      customerId,
+      totalSalesMeters: agg?.totalSalesMeters || 0,
+      totalAmount: agg?.totalAmount || 0,
+      outstanding: agg?.outstanding || 0,
+      outstandingDue: agg?.outstandingDue || 0,
+      asOf: now,
+    },
+  });
+});
+
+// Bulk sales summary for customers (used in agent modal customer table)
+const getCustomerSalesSummaryBulk = handleAsyncErrors(async (req, res) => {
+  const { customerIds = [] } = req.body || {};
+  const now = new Date();
+
+  const ids = Array.isArray(customerIds)
+    ? customerIds.filter(Boolean).map(String)
+    : [];
+
+  const validIds = ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const objectIds = validIds.map((id) => new mongoose.Types.ObjectId(id));
+
+  if (!objectIds.length) {
+    return res.json({ success: true, data: [] });
+  }
+
+  const totalsAgg = await SalesInvoice.aggregate([
+    { $match: { customerId: { $in: objectIds }, status: "Posted" } },
+    {
+      $group: {
+        _id: "$customerId",
+        totalAmount: { $sum: { $ifNull: ["$total", 0] } },
+        outstanding: {
+          $sum: {
+            $cond: [
+              { $and: [{ $ne: ["$paymentStatus", "Paid"] }] },
+              {
+                $cond: [
+                  { $gt: ["$outstandingAmount", 0] },
+                  "$outstandingAmount",
+                  {
+                    $subtract: [
+                      { $ifNull: ["$total", 0] },
+                      { $ifNull: ["$paidAmount", 0] },
+                    ],
+                  },
+                ],
+              },
+              0,
+            ],
+          },
+        },
+      },
+    },
+  ]);
+
+  const dueAgg = await SalesInvoice.aggregate([
+    {
+      $match: {
+        customerId: { $in: objectIds },
+        status: "Posted",
+        paymentStatus: { $ne: "Paid" },
+        dueDate: { $lte: now },
+      },
+    },
+    {
+      $group: {
+        _id: "$customerId",
+        outstandingDue: {
+          $sum: {
+            $cond: [
+              { $gt: ["$outstandingAmount", 0] },
+              "$outstandingAmount",
+              {
+                $subtract: [
+                  { $ifNull: ["$total", 0] },
+                  { $ifNull: ["$paidAmount", 0] },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    },
+  ]);
+
+  const metersAgg = await SalesInvoice.aggregate([
+    { $match: { customerId: { $in: objectIds }, status: "Posted" } },
+    { $unwind: { path: "$lines", preserveNullAndEmptyArrays: true } },
+    {
+      $group: {
+        _id: "$customerId",
+        totalSalesMeters: {
+          $sum: { $ifNull: ["$lines.billedLengthMeters", 0] },
+        },
+      },
+    },
+  ]);
+
+  const byId = new Map();
+  totalsAgg.forEach((r) => {
+    byId.set(String(r._id), {
+      customerId: String(r._id),
+      totalSalesMeters: 0,
+      totalAmount: r.totalAmount || 0,
+      outstanding: r.outstanding || 0,
+      outstandingDue: 0,
+      asOf: now,
+    });
+  });
+  metersAgg.forEach((r) => {
+    const key = String(r._id);
+    const cur = byId.get(key) || {
+      customerId: key,
+      totalSalesMeters: 0,
+      totalAmount: 0,
+      outstanding: 0,
+      outstandingDue: 0,
+      asOf: now,
+    };
+    cur.totalSalesMeters = r.totalSalesMeters || 0;
+    byId.set(key, cur);
+  });
+  dueAgg.forEach((r) => {
+    const key = String(r._id);
+    const cur = byId.get(key) || {
+      customerId: key,
+      totalSalesMeters: 0,
+      totalAmount: 0,
+      outstanding: 0,
+      outstandingDue: 0,
+      asOf: now,
+    };
+    cur.outstandingDue = r.outstandingDue || 0;
+    byId.set(key, cur);
+  });
+
+  const result = validIds.map((id) => byId.get(id) || {
+    customerId: id,
+    totalSalesMeters: 0,
+    totalAmount: 0,
+    outstanding: 0,
+    outstandingDue: 0,
+    asOf: now,
+  });
+
+  res.json({ success: true, data: result });
 });
 
 // Helper function to sanitize numeric values from formatted strings
@@ -228,12 +500,22 @@ const mapCustomerRateForUi = (rateDoc) => {
   if (!rateDoc) return rateDoc;
 
   const rate =
-    typeof rateDoc.toObject === "function" ? rateDoc.toObject() : { ...rateDoc };
+    typeof rateDoc.toObject === "function"
+      ? rateDoc.toObject({ virtuals: true })
+      : { ...rateDoc };
+
+  const baseRateVal =
+    rate.baseRate !== undefined && rate.baseRate !== null
+      ? rate.baseRate
+      : rate.rate;
 
   return {
     ...rate,
+    baseRate: baseRateVal,
     customerid: rate.customerId,
+    productid: rate.productId,
     skuid: rate.skuId,
+    validFrom: rate.validFrom || rate.updatedAt || rate.createdAt,
   };
 };
 
@@ -247,7 +529,6 @@ const createCustomer = handleAsyncErrors(async (req, res) => {
     contactPersons,
     referralSource,
     creditPolicy,
-    baseRate44,
     companyName,
     agentId,
     gstin,
@@ -280,7 +561,6 @@ const createCustomer = handleAsyncErrors(async (req, res) => {
 
   // Sanitize numeric fields
   const sanitizedCreditPolicy = sanitizeCreditPolicy(creditPolicy);
-  const sanitizedBaseRate44 = sanitizeNumericValue(baseRate44);
   const sanitizedContactPersons = sanitizeContactPersons(contactPersons);
   const sanitizedBusinessInfo = businessInfo ? {
     ...businessInfo,
@@ -301,7 +581,6 @@ const createCustomer = handleAsyncErrors(async (req, res) => {
     contactPersons: sanitizedContactPersons,
     referral: referralSource,
     creditPolicy: sanitizedCreditPolicy,
-    baseRate44: sanitizedBaseRate44,
     businessInfo: sanitizedBusinessInfo,
   });
 
@@ -331,8 +610,6 @@ const updateCustomer = handleAsyncErrors(async (req, res) => {
   if (!existingCustomer) {
     throw new AppError("Customer not found", 404, "RESOURCE_NOT_FOUND");
   }
-
-  const previousBaseRate44 = existingCustomer.baseRate44;
 
   const previousAgentId = existingCustomer.agentId;
 
@@ -376,10 +653,6 @@ const updateCustomer = handleAsyncErrors(async (req, res) => {
 
   if (Object.prototype.hasOwnProperty.call(updateData, "contactPersons")) {
     updateData.contactPersons = sanitizeContactPersons(updateData.contactPersons);
-  }
-  
-  if (updateData.baseRate44 !== undefined) {
-    updateData.baseRate44 = sanitizeNumericValue(updateData.baseRate44);
   }
   
   if (updateData.businessInfo) {
@@ -536,12 +809,19 @@ const unblockCustomer = handleAsyncErrors(async (req, res) => {
 
 // Delete customer
 const deleteCustomer = handleAsyncErrors(async (req, res) => {
-  const customer = await Customer.findByIdAndDelete(req.params.id);
+  const customer = await Customer.findById(req.params.id);
 
   if (!customer) {
     throw new AppError("Customer not found", 404, "RESOURCE_NOT_FOUND");
   }
 
+  const brIds = await BaseRate.find({ customerId: customer._id }).distinct("_id");
+  if (brIds.length) {
+    await RateHistory.deleteMany({ baseRateId: { $in: brIds } });
+  }
+  await BaseRate.deleteMany({ customerId: customer._id });
+
+  await Customer.findByIdAndDelete(req.params.id);
   await syncAgentCustomerMapping(customer._id, customer.agentId, null);
 
   res.json({
@@ -550,16 +830,9 @@ const deleteCustomer = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Get all active per-SKU rates for a customer
+// Get all active per-Product rates for a customer (BaseRate with customerId)
 const getCustomerRates = handleAsyncErrors(async (req, res) => {
-  const rates = await CustomerRate.find({
-    customerId: req.params.id,
-    active: true,
-    validTo: null,
-  })
-    .populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
-      populate: { path: "productId", select: "productCode productAlias" } })
-    .sort({ createdAt: -1 });
+  const rates = await customerService.getCustomerBaseRates(req.params.id);
 
   res.json({
     success: true,
@@ -568,10 +841,12 @@ const getCustomerRates = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Set (create or replace) a SKU rate for a customer
+// Set (create or replace) a Product rate for a customer
 const setCustomerRate = handleAsyncErrors(async (req, res) => {
   const { id } = req.params;
   const {
+    productId,
+    productid,
     skuId,
     skuid,
     baseRate,
@@ -580,12 +855,21 @@ const setCustomerRate = handleAsyncErrors(async (req, res) => {
     isSpecialRate,
     specialRateReason,
   } = req.body;
-  const resolvedSkuId = skuId || skuid;
+  const resolvedProductId = productId || productid;
   const resolvedBaseRate =
     baseRate !== undefined && baseRate !== null ? baseRate : incomingRate;
 
-  if (!resolvedSkuId)
-    throw new AppError("SKU is required", 400, "VALIDATION_ERROR");
+  let effectiveProductId = resolvedProductId;
+
+  // Backward compatibility: allow skuId and map it to productId
+  if (!effectiveProductId && (skuId || skuid)) {
+    const SKU = require("../models/SKU");
+    const skuDoc = await SKU.findById(skuId || skuid).select("productId");
+    effectiveProductId = skuDoc?.productId || null;
+  }
+
+  if (!effectiveProductId)
+    throw new AppError("Product is required", 400, "VALIDATION_ERROR");
   if (resolvedBaseRate === undefined || resolvedBaseRate === null)
     throw new AppError("Rate is required", 400, "VALIDATION_ERROR");
 
@@ -593,65 +877,51 @@ const setCustomerRate = handleAsyncErrors(async (req, res) => {
   if (numericRate < 0)
     throw new AppError("Rate must be non-negative", 400, "VALIDATION_ERROR");
 
-  // Expire any currently active rate for this customer+SKU
-  await CustomerRate.updateMany(
-    { customerId: id, skuId: resolvedSkuId, active: true, validTo: null },
-    { $set: { active: false, validTo: new Date() } }
-  );
-
-  const createdRate = await CustomerRate.create({
-    customerId: id,
-    skuId: resolvedSkuId,
-    baseRate: numericRate,
-    validFrom: new Date(),
-    validTo: null,
-    active: true,
-    notes: notes || "",
-    isSpecialRate: isSpecialRate || false,
-    specialRateReason: isSpecialRate ? specialRateReason : undefined,
-    approvedBy: req.user?._id,
-  });
-
-  await createdRate.populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
-    populate: { path: "productId", select: "productCode productAlias" } });
-
-  res.status(201).json({ success: true, data: mapCustomerRateForUi(createdRate) });
-});
-
-// Deactivate a SKU rate for a customer
-const deleteCustomerRate = handleAsyncErrors(async (req, res) => {
-  const { id, skuId } = req.params;
-
-  const result = await CustomerRate.updateMany(
-    { customerId: id, skuId, active: true, validTo: null },
-    { $set: { active: false, validTo: new Date() } }
-  );
-
-  if (result.modifiedCount === 0) {
-    throw new AppError(
-      "No active rate found for this SKU",
-      404,
-      "RESOURCE_NOT_FOUND"
-    );
+  let noteParts = [notes].filter(Boolean);
+  if (isSpecialRate && specialRateReason) {
+    noteParts.push(`Special: ${specialRateReason}`);
   }
+  const mergedNotes = noteParts.join(" — ");
 
-  res.json({ success: true, message: "SKU rate removed successfully" });
+  const saved = await customerService.setCustomerRate(
+    id,
+    effectiveProductId,
+    numericRate,
+    req.user?._id,
+    mergedNotes
+  );
+
+  res.status(201).json({ success: true, data: mapCustomerRateForUi(saved) });
 });
 
-// Get full rate history for a customer (optionally filtered by SKU)
+// Remove a Product benchmark rate for a customer
+const deleteCustomerRate = handleAsyncErrors(async (req, res) => {
+  const { id, productId } = req.params;
+
+  await customerService.deleteCustomerBaseRate(id, productId);
+
+  res.json({ success: true, message: "Product rate removed successfully" });
+});
+
+// Get full rate history for a customer (optionally filtered by Product)
 const getRateHistory = handleAsyncErrors(async (req, res) => {
   const { id } = req.params;
-  const { skuId, skuid, limit } = req.query;
+  const { productId, productid, skuId, skuid, limit } = req.query;
 
   const query = { customerId: id };
-  if (skuId || skuid) query.skuId = skuId || skuid;
+  if (productId || productid) query.productId = productId || productid;
+  // Backward compatibility for old query params
+  if (!query.productId && (skuId || skuid)) {
+    const SKU = require("../models/SKU");
+    const skuDoc = await SKU.findById(skuId || skuid).select("productId");
+    if (skuDoc?.productId) query.productId = skuDoc.productId;
+  }
 
-  const history = await CustomerRate.find(query)
-    .populate({ path: "skuId", select: "skuCode skuAlias widthInches productId",
-      populate: { path: "productId", select: "productCode productAlias" } })
-    .populate("approvedBy", "name")
-    .sort({ createdAt: -1 })
-    .limit(parseInt(limit) || 50);
+  const history = await customerService.getCustomerRateHistory(
+    id,
+    query.productId,
+    parseInt(limit, 10) || 50
+  );
 
   res.json({
     success: true,
@@ -672,17 +942,21 @@ const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
   const results = { updated: [], failed: [] };
 
   for (const update of rateUpdates) {
-    const resolvedSkuId = update.skuId || update.skuid;
+    const resolvedProductId = update.productId || update.productid;
     const resolvedBaseRate =
       update.baseRate !== undefined && update.baseRate !== null
         ? update.baseRate
         : update.rate;
     const { notes, isSpecialRate, specialRateReason } = update;
 
-    if (!resolvedSkuId || resolvedBaseRate === undefined || resolvedBaseRate === null) {
+    if (
+      !resolvedProductId ||
+      resolvedBaseRate === undefined ||
+      resolvedBaseRate === null
+    ) {
       results.failed.push({
-        skuId: resolvedSkuId,
-        reason: "skuId and baseRate are required",
+        productId: resolvedProductId,
+        reason: "productId and baseRate are required",
       });
       continue;
     }
@@ -690,31 +964,26 @@ const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
     const numericRate = sanitizeNumericValue(resolvedBaseRate);
     if (numericRate < 0) {
       results.failed.push({
-        skuId: resolvedSkuId,
+        productId: resolvedProductId,
         reason: "Rate must be non-negative",
       });
       continue;
     }
 
     try {
-      // Expire existing active rate
-      await CustomerRate.updateMany(
-        { customerId: id, skuId: resolvedSkuId, active: true, validTo: null },
-        { $set: { active: false, validTo: new Date() } }
-      );
+      let noteParts = [notes].filter(Boolean);
+      if (isSpecialRate && specialRateReason) {
+        noteParts.push(`Special: ${specialRateReason}`);
+      }
+      const mergedNotes = noteParts.join(" — ");
 
-      const rate = await CustomerRate.create({
-        customerId: id,
-        skuId: resolvedSkuId,
-        baseRate: numericRate,
-        validFrom: new Date(),
-        validTo: null,
-        active: true,
-        notes: notes || "",
-        isSpecialRate: isSpecialRate || false,
-        specialRateReason: isSpecialRate ? specialRateReason : undefined,
-        approvedBy: req.user?._id,
-      });
+      const rate = await customerService.setCustomerRate(
+        id,
+        resolvedProductId,
+        numericRate,
+        req.user?._id,
+        mergedNotes
+      );
 
       results.updated.push({
         ...mapCustomerRateForUi(rate),
@@ -722,7 +991,7 @@ const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
         baseRate: numericRate,
       });
     } catch (err) {
-      results.failed.push({ skuId: resolvedSkuId, reason: err.message });
+      results.failed.push({ productId: resolvedProductId, reason: err.message });
     }
   }
 
@@ -732,6 +1001,8 @@ const bulkUpdateCustomerRates = handleAsyncErrors(async (req, res) => {
 module.exports = {
   getCustomers,
   getCustomer,
+  getCustomerSalesSummary,
+  getCustomerSalesSummaryBulk,
   createCustomer,
   updateCustomer,
   checkCredit,

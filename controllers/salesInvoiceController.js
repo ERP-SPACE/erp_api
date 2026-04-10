@@ -70,6 +70,21 @@ const createSalesInvoice = handleAsyncErrors(async (req, res) => {
     throw new AppError("Customer is required", 400, "VALIDATION_ERROR");
   }
 
+  // Check if customer is blocked
+  const Customer = require("../models/Customer");
+  const customer = await Customer.findById(customerId).select("companyName creditPolicy");
+  if (!customer) {
+    throw new AppError("Customer not found", 404, "RESOURCE_NOT_FOUND");
+  }
+  if (customer.creditPolicy?.isBlocked) {
+    const blockReason = customer.creditPolicy.blockReason || "Customer is blocked";
+    throw new AppError(
+      `Cannot create sales invoice: ${customer.companyName} is blocked. Reason: ${blockReason}`,
+      400,
+      "CUSTOMER_BLOCKED"
+    );
+  }
+
   const siNumber = await numberingService.generateNumber("SI", SalesInvoice);
 
   let subtotal = 0;

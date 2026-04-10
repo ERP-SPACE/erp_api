@@ -9,6 +9,8 @@ router.get("/", customerController.getCustomers);
 
 // Specific sub-routes BEFORE /:id to avoid route shadowing
 router.get("/:id/credit-check", customerController.checkCredit);
+router.get("/:id/sales-summary", customerController.getCustomerSalesSummary);
+router.post("/sales-summary", customerController.getCustomerSalesSummaryBulk);
 router.get("/:id/rate-history", customerController.getRateHistory);
 router.get("/:id/rates", customerController.getCustomerRates);
 
@@ -22,7 +24,7 @@ router.post("/:id/unblock", customerController.unblockCustomer);
 
 router.patch("/:id", customerController.updateCustomer);
 
-router.delete("/:id/rates/:skuId", customerController.deleteCustomerRate);
+router.delete("/:id/rates/:productId", customerController.deleteCustomerRate);
 router.delete("/:id", customerController.deleteCustomer);
 
 module.exports = router;

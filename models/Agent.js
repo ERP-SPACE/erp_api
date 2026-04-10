@@ -222,10 +222,15 @@ const commissionChangeSchema = new mongoose.Schema(
 
 const defaultSkuRateSchema = new mongoose.Schema(
   {
+    // 44" benchmark is per Product (aligned with BaseRate.productId)
+    product: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+    },
+    /** @deprecated Legacy field — prefer `product`; may still exist on old documents */
     sku: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "SKU",
-      required: true,
     },
     rate: {
       type: Number,
@@ -298,6 +303,10 @@ const agentSchema = new mongoose.Schema(
       type: Number,
       min: 0,
     },
+    defaultGraceDays: {
+      type: Number,
+      min: 0,
+    },
     notes: String,
     active: {
       type: Boolean,
@@ -350,7 +359,7 @@ agentSchema.index({ name: "text", companyName: "text" });
 agentSchema.index({ "partyCommissions.customer": 1 });
 agentSchema.index({ "commissionPayouts.payoutStatus": 1 });
 agentSchema.index({ blockNewSalesForAllParties: 1 });
-agentSchema.index({ "defaultSkuRates.sku": 1 });
+agentSchema.index({ "defaultSkuRates.product": 1 });
 
 // Generate agent code
 agentSchema.pre("save", async function (next) {

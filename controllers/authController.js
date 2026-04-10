@@ -1,21 +1,15 @@
-const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
-
-const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
-
-const signToken = (user) =>
-  jwt.sign(
-    {
-      userId: user._id,
-      role: user.role,
-    },
-    JWT_SECRET,
-    {
-      expiresIn: JWT_EXPIRES_IN,
-    }
-  );
+const {
+  ACCESS_TOKEN_EXPIRES_IN,
+  REFRESH_TOKEN_TTL_DAYS,
+  createSession,
+  ensureJwtSecret,
+  findActiveSessionByRefreshToken,
+  revokeAllUserSessions,
+  revokeSession,
+  rotateSession,
+} = require("../utils/tokenService");
 
 const sanitizeUser = (user) => {
   const obj = user.toObject({ versionKey: false });
@@ -23,11 +17,25 @@ const sanitizeUser = (user) => {
   return obj;
 };
 
-// Register new user (default SalesExec) — requires full address per model
+const getRequestMetadata = (req) => ({
+  userAgent: req.get("user-agent") || "",
+  ipAddress: req.ip || req.headers["x-forwarded-for"] || "",
+});
+
+const buildAuthResponse = (user, authResult) => ({
+  success: true,
+  token: authResult.accessToken,
+  accessToken: authResult.accessToken,
+  refreshToken: authResult.refreshToken,
+  accessTokenExpiresIn: ACCESS_TOKEN_EXPIRES_IN,
+  refreshTokenTtlDays: REFRESH_TOKEN_TTL_DAYS,
+  sessionId: authResult.session._id,
+  user: sanitizeUser(user),
+});
+
+// Register new user (default SalesExec) â€” requires full address per model
 const register = handleAsyncErrors(async (req, res) => {
-  if (!JWT_SECRET) {
-    throw new AppError("Server misconfigured: JWT secret missing", 500);
-  }
+  ensureJwtSecret();
 
   const explicitAllow =
     (process.env.ALLOW_PUBLIC_REGISTRATION || "").toLowerCase() === "true";
@@ -50,7 +58,6 @@ const register = handleAsyncErrors(async (req, res) => {
     throw new AppError("Username, email and password are required", 400);
   }
 
-  // Never allow clients to self-assign privileged roles
   const role = "SalesExec";
 
   const addressPayload = {
@@ -61,10 +68,7 @@ const register = handleAsyncErrors(async (req, res) => {
   };
 
   if (!addressPayload.line1 || !addressPayload.city || !addressPayload.pincode) {
-    throw new AppError(
-      "Address line1, city and pincode are required",
-      400
-    );
+    throw new AppError("Address line1, city and pincode are required", 400);
   }
 
   if (!state || !country) {
@@ -81,20 +85,14 @@ const register = handleAsyncErrors(async (req, res) => {
     country,
   });
 
-  const token = signToken(user);
+  const authResult = await createSession(user, getRequestMetadata(req));
 
-  res.status(201).json({
-    success: true,
-    token,
-    user: sanitizeUser(user),
-  });
+  res.status(201).json(buildAuthResponse(user, authResult));
 });
 
 // Login with username or email
 const login = handleAsyncErrors(async (req, res) => {
-  if (!JWT_SECRET) {
-    throw new AppError("Server misconfigured: JWT secret missing", 500);
-  }
+  ensureJwtSecret();
 
   const { identifier, password } = req.body;
 
@@ -103,7 +101,10 @@ const login = handleAsyncErrors(async (req, res) => {
   }
 
   const user = await User.findOne({
-    $or: [{ email: identifier.toLowerCase() }, { username: identifier.toLowerCase() }],
+    $or: [
+      { email: identifier.toLowerCase() },
+      { username: identifier.toLowerCase() },
+    ],
   }).select("+password");
 
   if (!user || !(await user.correctPassword(password))) {
@@ -113,16 +114,52 @@ const login = handleAsyncErrors(async (req, res) => {
   user.lastLogin = new Date();
   await user.save({ validateBeforeSave: false });
 
-  const token = signToken(user);
+  const authResult = await createSession(user, getRequestMetadata(req));
+
+  res.json(buildAuthResponse(user, authResult));
+});
+
+const refreshSession = handleAsyncErrors(async (req, res) => {
+  ensureJwtSecret();
+
+  const { refreshToken } = req.body || {};
+  if (!refreshToken) {
+    throw new AppError("Refresh token is required", 400, "VALIDATION_ERROR");
+  }
+
+  const session = await findActiveSessionByRefreshToken(refreshToken);
+  if (!session) {
+    throw new AppError("Invalid session", 401, "INVALID_SESSION");
+  }
+
+  const user = await User.findById(session.userId);
+  if (!user || user.active === false) {
+    await revokeSession(session._id);
+    throw new AppError("Invalid session", 401, "INVALID_SESSION");
+  }
+
+  const authResult = await rotateSession(session, user);
+  res.json(buildAuthResponse(user, authResult));
+});
+
+const logout = handleAsyncErrors(async (req, res) => {
+  const { refreshToken } = req.body || {};
+
+  if (req.sessionId) {
+    await revokeSession(req.sessionId);
+  } else if (refreshToken) {
+    const session = await findActiveSessionByRefreshToken(refreshToken);
+    if (session) {
+      await revokeSession(session._id);
+    }
+  }
 
   res.json({
     success: true,
-    token,
-    user: sanitizeUser(user),
+    message: "Logged out successfully",
   });
 });
 
-// Update logged-in user's profile (username, email, phone)
 const updateProfile = handleAsyncErrors(async (req, res) => {
   const ALLOWED_FIELDS = ["username", "email", "phone"];
   const updates = {};
@@ -152,7 +189,6 @@ const updateProfile = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Change password for the logged-in user
 const changePassword = handleAsyncErrors(async (req, res) => {
   const { currentPassword, newPassword } = req.body;
 
@@ -176,6 +212,7 @@ const changePassword = handleAsyncErrors(async (req, res) => {
 
   user.password = newPassword;
   await user.save();
+  await revokeAllUserSessions(user._id);
 
   res.json({
     success: true,
@@ -186,6 +223,8 @@ const changePassword = handleAsyncErrors(async (req, res) => {
 module.exports = {
   register,
   login,
+  refreshSession,
+  logout,
   updateProfile,
   changePassword,
 };

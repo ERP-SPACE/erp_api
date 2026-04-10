@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const AppError = require("../utils/AppError");
 const User = require("../models/User");
+const UserSession = require("../models/UserSession");
 
 const authenticate = async (req, res, next) => {
   try {
@@ -15,6 +16,9 @@ const authenticate = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.type !== "access" || !decoded.sessionId) {
+      throw new AppError("Please authenticate", 401);
+    }
 
     const user = await User.findById(decoded.userId).select(
       "role active passwordChangedAt"
@@ -27,9 +31,21 @@ const authenticate = async (req, res, next) => {
       throw new AppError("Please authenticate", 401);
     }
 
+    const session = await UserSession.findOne({
+      _id: decoded.sessionId,
+      userId: decoded.userId,
+      revokedAt: null,
+      expiresAt: { $gt: new Date() },
+    }).select("_id");
+
+    if (!session) {
+      throw new AppError("Please authenticate", 401);
+    }
+
     req.userId = user._id.toString();
     req.userRole = user.role;
     req.user = user;
+    req.sessionId = session._id.toString();
 
     next();
   } catch (error) {

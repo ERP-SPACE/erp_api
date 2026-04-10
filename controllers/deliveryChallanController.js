@@ -79,6 +79,18 @@ const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
     throw new AppError("Sales order not found", 404, "RESOURCE_NOT_FOUND");
   }
 
+  // Check if customer is blocked
+  const Customer = require("../models/Customer");
+  const customer = await Customer.findById(salesOrder.customerId).select("companyName creditPolicy");
+  if (customer?.creditPolicy?.isBlocked) {
+    const blockReason = customer.creditPolicy.blockReason || "Customer is blocked";
+    throw new AppError(
+      `Cannot create delivery challan: ${customer.companyName} is blocked. Reason: ${blockReason}`,
+      400,
+      "CUSTOMER_BLOCKED"
+    );
+  }
+
   const dcNumber = await numberingService.generateNumber(
     "DC",
     DeliveryChallan

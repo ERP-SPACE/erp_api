@@ -9,7 +9,7 @@ const Supplier = require("../models/Supplier");
 const User = require("../models/User");
 const CustomerGroup = require("../models/CustomerGroup");
 const Customer = require("../models/Customer");
-const CustomerRate = require("../models/CustomerRate");
+const BaseRate = require("../models/BaseRate");
 const Ledger = require("../models/Ledger");
 const Agent = require("../models/Agent");
 
@@ -52,7 +52,7 @@ const seedData = async () => {
       await Product.deleteMany({});
       await SKU.deleteMany({});
       await Supplier.deleteMany({});
-      await CustomerRate.deleteMany({});
+      await BaseRate.deleteMany({ customerId: { $ne: null } });
       await Customer.deleteMany({});
       await CustomerGroup.deleteMany({});
       await Agent.deleteMany({});
@@ -480,6 +480,7 @@ const seedData = async () => {
               defaultRate: 118,
               defaultCreditLimit: 400000,
               defaultCreditDays: 30,
+              defaultGraceDays: 7,
               customers: [abcCustomer._id],
               notes: "Handles major export-oriented accounts",
               kycDocuments: [
@@ -554,6 +555,7 @@ const seedData = async () => {
               defaultRate: 120,
               defaultCreditLimit: 250000,
               defaultCreditDays: 20,
+              defaultGraceDays: 5,
               blockNewSalesForAllParties: false,
               blockNewDeliveriesForAllParties: false,
               blockedSalesCustomers: xyzCustomer ? [xyzCustomer._id] : [],
@@ -646,7 +648,7 @@ const seedData = async () => {
       const customerRates = [];
       const customers = await Customer.find({}).populate("customerGroupId");
       for (const customer of customers) {
-        // Set baseRate44 seed per customer group
+        // Seed the 44" benchmark rate per product (BaseRate with customerId)
         // Wholesale group gets 120, others get 125
         const customerGroupName = customer.customerGroupId?.name || "";
         const defaultRate = customerGroupName === "Wholesale" ? 120 : 125;
@@ -654,14 +656,13 @@ const seedData = async () => {
           customerRates.push({
             customerId: customer._id,
             productId: product._id,
-            baseRate44: defaultRate,
-            active: true,
+            rate: defaultRate,
           });
         }
       }
 
       if (customerRates.length > 0) {
-        await CustomerRate.insertMany(customerRates, { ordered: false });
+        await BaseRate.insertMany(customerRates, { ordered: false });
         console.log(`${customerRates.length} customer rates seeded`);
       }
     } catch (error) {

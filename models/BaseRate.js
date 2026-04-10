@@ -6,10 +6,10 @@ const baseRateSchema = new mongoose.Schema(
       type: Number,
       unique: true,
     },
-    skuId: {
+    productId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "SKU",
-      required: [true, "SKU is required"],
+      ref: "Product",
+      required: [true, "Product is required"],
     },
     supplierId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -41,33 +41,33 @@ const baseRateSchema = new mongoose.Schema(
 
 // Indexes
 baseRateSchema.index({ baseRateId: 1 });
-baseRateSchema.index({ skuId: 1 });
+baseRateSchema.index({ productId: 1 });
 baseRateSchema.index({ supplierId: 1 });
 baseRateSchema.index({ agentId: 1 });
 baseRateSchema.index({ customerId: 1 });
 
-// Unique compound indexes: One rate per SKU per entity
-// Ensures a supplier can only have one rate per SKU
+// Unique compound indexes: One rate per Product per entity
+// Ensures a supplier can only have one rate per Product
 baseRateSchema.index(
-  { skuId: 1, supplierId: 1 },
+  { productId: 1, supplierId: 1 },
   {
     unique: true,
     partialFilterExpression: { supplierId: { $ne: null } },
   }
 );
 
-// Ensures an agent can only have one rate per SKU
+// Ensures an agent can only have one rate per Product
 baseRateSchema.index(
-  { skuId: 1, agentId: 1 },
+  { productId: 1, agentId: 1 },
   {
     unique: true,
     partialFilterExpression: { agentId: { $ne: null } },
   }
 );
 
-// Ensures a customer can only have one rate per SKU
+// Ensures a customer can only have one rate per Product
 baseRateSchema.index(
-  { skuId: 1, customerId: 1 },
+  { productId: 1, customerId: 1 },
   {
     unique: true,
     partialFilterExpression: { customerId: { $ne: null } },
@@ -115,10 +115,10 @@ baseRateSchema.pre("save", async function (next) {
   next();
 });
 
-// Virtual to populate SKU
-baseRateSchema.virtual("sku", {
-  ref: "SKU",
-  localField: "skuId",
+// Virtual to populate Product
+baseRateSchema.virtual("product", {
+  ref: "Product",
+  localField: "productId",
   foreignField: "_id",
   justOne: true,
 });

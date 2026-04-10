@@ -1,6 +1,7 @@
 // services/customerService.js
 const Customer = require("../models/Customer");
-const CustomerRate = require("../models/CustomerRate");
+const BaseRate = require("../models/BaseRate");
+const RateHistory = require("../models/RateHistory");
 const Agent = require("../models/Agent");
 const AppError = require("../utils/AppError");
 const mongoose = require("mongoose");
@@ -168,17 +169,12 @@ class CustomerService {
       throw new AppError("Customer not found", 404);
     }
 
-    // Get customer rates
-    const rates = await CustomerRate.find({
+    // 44" benchmark rates per product (same collection as supplier/agent base rates)
+    const rates = await BaseRate.find({
       customerId: id,
-      active: true,
     }).populate({
-      path: "skuId",
-      select: "skuCode skuAlias widthInches productId",
-      populate: {
-        path: "productId",
-        select: "productCode productAlias taxRate",
-      },
+      path: "productId",
+      select: "productCode productAlias taxRate",
     });
 
     return { customer, rates };
@@ -290,6 +286,32 @@ class CustomerService {
     customer.notes = notes;
 
     await customer.save();
+    return customer;
+  }
+
+  /**
+   * Check if customer is blocked and throw error if blocked.
+   * Used for: Sales Order, Sales Invoice, Delivery Challan creation
+   * @param {string} customerId - Customer ID
+   * @param {string} operationType - Type of operation (SalesOrder, SalesInvoice, DeliveryChallan)
+   * @throws {AppError} If customer is blocked
+   */
+  async checkIfBlocked(customerId, operationType = "Sales") {
+    const customer = await Customer.findById(customerId).select("companyName creditPolicy");
+    
+    if (!customer) {
+      throw new AppError("Customer not found", 404, "RESOURCE_NOT_FOUND");
+    }
+
+    if (customer.creditPolicy?.isBlocked) {
+      const blockReason = customer.creditPolicy.blockReason || "Customer is blocked";
+      throw new AppError(
+        `Cannot create ${operationType}: ${customer.companyName} is blocked. Reason: ${blockReason}`,
+        400,
+        "CUSTOMER_BLOCKED"
+      );
+    }
+
     return customer;
   }
 
@@ -426,124 +448,144 @@ class CustomerService {
     };
   }
 
-  async setCustomerRate(customerId, productId, baseRate44, userId, notes) {
-    const skuId = productId;
-    const baseRate = baseRate44;
-    if (!skuId) {
-      throw new AppError("skuId is required", 400);
+  /**
+   * All active customer benchmark rates (BaseRate rows with customerId set).
+   */
+  async getCustomerBaseRates(customerId) {
+    return BaseRate.find({ customerId })
+      .populate({
+        path: "productId",
+        select: "productCode productAlias categoryId gsmId qualityId taxRate",
+        populate: [
+          { path: "categoryId", select: "name" },
+          { path: "gsmId", select: "name value" },
+          { path: "qualityId", select: "name" },
+        ],
+      })
+      .sort({ updatedAt: -1 });
+  }
+
+  async setCustomerRate(customerId, productId, baseRate, userId, notes) {
+    if (!productId) {
+      throw new AppError("productId is required", 400);
     }
     if (baseRate === undefined || baseRate === null) {
       throw new AppError("baseRate is required", 400);
     }
 
-    // Deactivate existing rate
-    await CustomerRate.updateMany(
-      {
-        customerId,
-        skuId,
-        active: true,
-      },
-      {
-        active: false,
-        validTo: new Date(),
-      }
-    );
+    const Product = require("../models/Product");
+    const product = await Product.findById(productId);
+    if (!product) {
+      throw new AppError("Product not found", 404);
+    }
 
-    // Create new rate
-    const rate = await CustomerRate.create({
-      customerId,
-      skuId,
-      baseRate,
-      approvedBy: userId,
-      notes,
-      validFrom: new Date(),
-      validTo: null,
-      active: true,
+    const numericRate = Number(baseRate);
+    if (Number.isNaN(numericRate) || numericRate < 0) {
+      throw new AppError("Rate must be a non-negative number", 400);
+    }
+
+    let doc = await BaseRate.findOne({ customerId, productId });
+
+    if (doc) {
+      await RateHistory.create({
+        baseRateId: doc._id,
+        productId: doc.productId,
+        supplierId: null,
+        agentId: null,
+        customerId: doc.customerId,
+        previousRate: doc.rate,
+      });
+      doc.rate = numericRate;
+      await doc.save();
+    } else {
+      doc = await BaseRate.create({
+        customerId,
+        productId,
+        rate: numericRate,
+      });
+    }
+
+    await doc.populate({
+      path: "productId",
+      select: "productCode productAlias categoryId gsmId qualityId taxRate",
+      populate: [
+        { path: "categoryId", select: "name" },
+        { path: "gsmId", select: "name value" },
+        { path: "qualityId", select: "name" },
+      ],
     });
 
-    return rate;
+    return doc;
+  }
+
+  async deleteCustomerBaseRate(customerId, productId) {
+    const baseRate = await BaseRate.findOne({ customerId, productId });
+    if (!baseRate) {
+      throw new AppError("No rate found for this product", 404);
+    }
+    await RateHistory.deleteMany({ baseRateId: baseRate._id });
+    await BaseRate.findByIdAndDelete(baseRate._id);
+    return { message: "Product rate removed successfully" };
   }
 
   async bulkUpdateRates(customerId, rateUpdates, userId) {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    const results = [];
 
-    try {
-      const results = [];
-
-      for (const update of rateUpdates) {
-        const skuId = update.skuId || update.productId;
-        const baseRate = update.baseRate ?? update.baseRate44;
-        if (!skuId) {
-          throw new AppError("Each rate update must include skuId", 400);
-        }
-        if (baseRate === undefined || baseRate === null) {
-          throw new AppError("Each rate update must include baseRate", 400);
-        }
-
-        // Deactivate old rate
-        await CustomerRate.updateMany(
-          {
-            customerId,
-            skuId,
-            active: true,
-          },
-          {
-            active: false,
-            validTo: new Date(),
-          },
-          { session }
-        );
-
-        // Create new rate
-        const rate = await CustomerRate.create(
-          [
-            {
-              customerId,
-              skuId,
-              baseRate,
-              approvedBy: userId,
-              notes: update.notes,
-              validFrom: new Date(),
-              validTo: null,
-              active: true,
-            },
-          ],
-          { session }
-        );
-
-        results.push(rate[0]);
+    for (const update of rateUpdates) {
+      const productId = update.productId || update.productid;
+      const rateVal = update.baseRate;
+      if (!productId) {
+        throw new AppError("Each rate update must include productId", 400);
+      }
+      if (rateVal === undefined || rateVal === null) {
+        throw new AppError("Each rate update must include baseRate", 400);
       }
 
-      await session.commitTransaction();
-      return results;
-    } catch (error) {
-      await session.abortTransaction();
-      throw error;
-    } finally {
-      session.endSession();
+      const doc = await this.setCustomerRate(
+        customerId,
+        productId,
+        rateVal,
+        userId,
+        update.notes
+      );
+      results.push(doc);
     }
+
+    return results;
   }
 
-  async getCustomerRateHistory(customerId, productId = null) {
+  /**
+   * Rate change log from RateHistory (previous rate before each update).
+   */
+  async getCustomerRateHistory(customerId, productId = null, limit = 50) {
     const query = { customerId };
     if (productId) {
-      query.skuId = productId;
+      query.productId = productId;
     }
 
-    const history = await CustomerRate.find(query)
+    const history = await RateHistory.find(query)
       .populate({
-        path: "skuId",
-        select: "skuCode skuAlias widthInches productId",
-        populate: {
-          path: "productId",
-          select: "productCode productAlias taxRate",
-        },
+        path: "productId",
+        select: "productCode productAlias categoryId gsmId qualityId taxRate",
+        populate: [
+          { path: "categoryId", select: "name" },
+          { path: "gsmId", select: "name value" },
+          { path: "qualityId", select: "name" },
+        ],
       })
-      .populate("approvedBy", "name")
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit, 10) || 50);
 
-    return history;
+    return history.map((h) => {
+      const o = h.toObject({ virtuals: true });
+      return {
+        ...o,
+        baseRate: o.previousRate,
+        validFrom: o.createdAt,
+        validTo: null,
+        notes: "",
+      };
+    });
   }
 
   async queueWhatsAppMessage(customer, templateType, data) {

@@ -82,11 +82,6 @@ const customerSchema = new mongoose.Schema(
       targetSalesMeters: Number,
       businessType: String,
     },
-    baseRate44: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
     creditPolicy: {
       creditLimit: {
         type: Number,
@@ -152,7 +147,6 @@ const customerSchema = new mongoose.Schema(
       },
     },
     notes: String,
-    tags: [String],
     active: {
       type: Boolean,
       default: true,
@@ -185,26 +179,21 @@ customerSchema.index({ companyName: "text" });
 
 // Generate customer code
 customerSchema.pre("save", async function (next) {
-  if (!this.customerCode && this.isNew && this.customerGroupId) {
+  if (!this.customerCode && this.isNew) {
     try {
-      const CustomerGroup = mongoose.model("CustomerGroup");
-      
-      // Fetch customer group to get the code for prefix
-      const customerGroup = await CustomerGroup.findById(this.customerGroupId);
-      
-      if (!customerGroup || !customerGroup.code) {
-        return next(new Error("Customer group not found or invalid"));
-      }
-      
-      // Use the code from CustomerGroup as prefix (e.g., "CSH", "WHL", "BIG", "REG")
-      const prefix = customerGroup.code;
+      const prefix = "CUS";
+      const lastCustomer = await this.constructor
+        .findOne({
+          customerCode: { $regex: `^${prefix}\\d+$`, $options: "i" },
+        })
+        .sort({ customerCode: -1 })
+        .select("customerCode");
 
-      // Count customers with the same customerGroupId
-      const count = await this.constructor.countDocuments({
-        customerGroupId: this.customerGroupId,
-      });
+      const lastSequence = lastCustomer?.customerCode
+        ? parseInt(lastCustomer.customerCode.replace(prefix, ""), 10)
+        : 0;
 
-      this.customerCode = `${prefix}${(count + 1).toString().padStart(5, "0")}`;
+      this.customerCode = `${prefix}${String(lastSequence + 1).padStart(5, "0")}`;
     } catch (error) {
       return next(error);
     }

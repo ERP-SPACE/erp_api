@@ -112,7 +112,7 @@ class SupplierController {
   });
 
   upsertSupplierBaseRate = catchAsync(async (req, res) => {
-    const skuId = req.body.skuId || req.body.skuid;
+    const productId = req.body.productId || req.body.productid;
     const rate =
       req.body.rate !== undefined && req.body.rate !== null
         ? req.body.rate
@@ -120,7 +120,7 @@ class SupplierController {
 
     const baseRate = await supplierService.upsertSupplierBaseRate(
       req.params.id,
-      skuId,
+      productId,
       rate
     );
 
@@ -172,7 +172,7 @@ class SupplierController {
     const rates = Array.isArray(req.body.rates)
       ? req.body.rates.map((entry = {}) => ({
           ...entry,
-          skuId: entry.skuId || entry.skuid,
+          productId: entry.productId || entry.productid,
           rate:
             entry.rate !== undefined && entry.rate !== null
               ? entry.rate
