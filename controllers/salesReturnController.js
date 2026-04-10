@@ -13,6 +13,22 @@ const toNumber = (value) => {
   return Number.isNaN(numeric) ? 0 : numeric;
 };
 
+/** Match salesInvoiceController: tax-exclusive rate/roll from tax-inclusive lineTotal when rate missing. */
+function resolveRatePerRollFromLine(line) {
+  const qty = toNumber(line.qtyRolls) || 1;
+  let rate = toNumber(line.ratePerRoll);
+  if (rate > 0) return { qty, rate };
+  const lt = toNumber(line.lineTotal);
+  if (lt > 0) {
+    const taxRate = toNumber(line.taxRate);
+    const discountPct = toNumber(line.discountLine);
+    const taxableFromTotal = taxRate > 0 ? lt / (1 + taxRate / 100) : lt;
+    const factor = qty * (1 - discountPct / 100);
+    rate = factor > 0 ? taxableFromTotal / factor : 0;
+  }
+  return { qty, rate };
+}
+
 const ensureSystemLedger = async (code) => {
   const existing = await Ledger.findOne({ ledgerCode: code });
   if (existing) return existing;
@@ -137,10 +153,13 @@ const createSalesReturn = handleAsyncErrors(async (req, res) => {
       (l) => (l?.rollId?.toString?.() || String(l?.rollId || "")) === String(rollId)
     );
 
-    const qty = 1;
-    const rate = toNumber(siLine?.ratePerRoll);
     const discountPct = toNumber(siLine?.discountLine);
     const taxRate = toNumber(siLine?.taxRate);
+
+    const { qty, rate } = resolveRatePerRollFromLine({
+      ...siLine,
+      qtyRolls: 1,
+    });
 
     const lineSubtotal = qty * rate;
     const lineDiscount = lineSubtotal * (discountPct / 100);
@@ -293,8 +312,7 @@ const postSalesReturn = handleAsyncErrors(async (req, res) => {
 
   // Compute taxable base from stored lines (tax reversal must mirror SI exactly)
   const taxableBase = (salesReturn.lines || []).reduce((sum, line = {}) => {
-    const qty = toNumber(line.qtyRolls) || 1;
-    const rate = toNumber(line.ratePerRoll);
+    const { qty, rate } = resolveRatePerRollFromLine(line);
     const discountPct = toNumber(line.discountLine);
     const lineSubtotal = qty * rate;
     const lineDiscount = lineSubtotal * (discountPct / 100);

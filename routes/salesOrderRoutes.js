@@ -7,6 +7,7 @@ const {
   createSalesOrder,
   updateSalesOrder,
   confirmSalesOrder,
+  recheckSalesOrderCredit,
   cancelSalesOrder,
   holdSalesOrder,
   closeSalesOrder,
@@ -30,6 +31,7 @@ router.route("/:id")
   .put(updateSalesOrder);
 
 router.post("/:id/confirm", confirmSalesOrder);
+router.post("/:id/recheck-credit", recheckSalesOrderCredit);
 router.post("/:id/cancel", cancelSalesOrder);
 router.post("/:id/hold", holdSalesOrder);
 router.post("/:id/close", closeSalesOrder);

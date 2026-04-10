@@ -4,6 +4,24 @@ const numberingService = require("../services/numberingService");
 const { STATUS } = require("../config/constants");
 const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
 
+/** Tax-exclusive rate per roll when missing: derive from tax-inclusive lineTotal. */
+function resolveInvoiceLineRatePerRoll(line) {
+  const qty = Number(line.qtyRolls) || 0;
+  let rate = Number(line.ratePerRoll) || 0;
+  if (rate > 0 && qty >= 0) return { qty: qty || 1, rate };
+
+  const q = qty > 0 ? qty : 1;
+  const lt = Number(line.lineTotal);
+  if (lt > 0) {
+    const taxRate = Number(line.taxRate) || 0;
+    const discountPct = Number(line.discountLine) || 0;
+    const taxableFromTotal = taxRate > 0 ? lt / (1 + taxRate / 100) : lt;
+    const factor = q * (1 - discountPct / 100);
+    rate = factor > 0 ? taxableFromTotal / factor : 0;
+  }
+  return { qty: q, rate };
+}
+
 // List invoices with basic filters
 const getSalesInvoices = handleAsyncErrors(async (req, res) => {
   const { status, customerId, salesOrderId, dateFrom, dateTo } = req.query;
@@ -92,8 +110,7 @@ const createSalesInvoice = handleAsyncErrors(async (req, res) => {
   let totalCOGS = 0;
 
   const processedLines = (lines || []).map((line) => {
-    const qty = Number(line.qtyRolls) || 0;
-    const rate = Number(line.ratePerRoll) || 0;
+    const { qty, rate } = resolveInvoiceLineRatePerRoll(line);
     const discountPct = Number(line.discountLine) || 0;
     const taxRate = Number(line.taxRate) || 0;
     const lineSubtotal = qty * rate;

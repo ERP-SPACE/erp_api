@@ -59,8 +59,8 @@ const deliveryChallanSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: [STATUS.OPEN, STATUS.CLOSED],
-      default: STATUS.OPEN,
+      enum: [STATUS.DRAFT, STATUS.POSTED, STATUS.CLOSED],
+      default: STATUS.DRAFT,
     },
     lines: [deliveryChallanLineSchema],
     vehicleNumber: String,

@@ -10,6 +10,86 @@ const { handleAsyncErrors, AppError } = require("../utils/errorHandler");
 
 // ─── Shared line builder ────────────────────────────────────────────────────
 
+async function runCreditCheckForSalesOrder(salesOrder) {
+  // Credit check: compare (outstanding AR + pending SO + this SO) against limit
+  const customer = await Customer.findById(salesOrder.customerId);
+  let creditCheckPassed = true;
+  let creditCheckNotes = "";
+
+  if (customer && customer.creditPolicy) {
+    const policy = customer.creditPolicy;
+
+    if (policy.isBlocked) {
+      throw new AppError(
+        "Customer is blocked — cannot confirm order",
+        400,
+        "CUSTOMER_BLOCKED"
+      );
+    }
+
+    const creditLimit = Number(policy.creditLimit) || 0;
+    if (creditLimit > 0) {
+      // Count pending SO value from other confirmed/partially-fulfilled SOs
+      const outstandingSOs = await SalesOrder.aggregate([
+        {
+          $match: {
+            customerId: salesOrder.customerId,
+            _id: { $ne: salesOrder._id },
+            status: { $in: ["Confirmed", "PartiallyFulfilled"] },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$total" } } },
+      ]);
+      const pendingSOValue = outstandingSOs[0]?.total || 0;
+
+      // Count outstanding AR from posted invoices
+      const SalesInvoice = require("../models/SalesInvoice");
+      const outstandingAgg = await SalesInvoice.aggregate([
+        {
+          $match: {
+            customerId: salesOrder.customerId,
+            status: "Posted",
+            paymentStatus: { $ne: "Paid" },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: {
+              $sum: {
+                $cond: [
+                  { $gt: ["$outstandingAmount", 0] },
+                  "$outstandingAmount",
+                  {
+                    $subtract: [
+                      { $ifNull: ["$total", 0] },
+                      { $ifNull: ["$paidAmount", 0] },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ]);
+      const outstandingAR = outstandingAgg[0]?.total || 0;
+      const exposureAfterConfirm =
+        outstandingAR + pendingSOValue + (salesOrder.total || 0);
+
+      if (exposureAfterConfirm > creditLimit) {
+        creditCheckPassed = false;
+        creditCheckNotes = `Credit limit ₹${creditLimit.toLocaleString("en-IN")} would be exceeded. Current exposure: ₹${(
+          outstandingAR + pendingSOValue
+        ).toLocaleString("en-IN")}, this order: ₹${(
+          salesOrder.total || 0
+        ).toLocaleString("en-IN")}.`;
+      }
+    }
+  }
+
+  return { creditCheckPassed, creditCheckNotes };
+}
+
 /**
  * Build a fully-processed line object for storage.
  * Runs the allocation algorithm against live inventory and attaches the result.
@@ -67,6 +147,15 @@ async function buildProcessedLine(line, sku, lineTotal, lineTax = 0, runAllocati
     }
   }
 
+  const qtyRollsNum = Number(line.qtyRolls) || 0;
+  const derivedRatePerRoll =
+    qtyRollsNum > 0 && lineTotal != null ? Number(lineTotal) / qtyRollsNum : 0;
+  const override = line.overrideRatePerRoll;
+  const finalRatePerRoll =
+    override !== undefined && override !== null && override !== ""
+      ? Number(override)
+      : derivedRatePerRoll;
+
   return {
     skuId: line.skuId,
     categoryName,
@@ -79,6 +168,8 @@ async function buildProcessedLine(line, sku, lineTotal, lineTax = 0, runAllocati
     bifurcations: Array.isArray(line.bifurcations) ? line.bifurcations : [],
     ...allocationData,
     overrideRatePerRoll: line.overrideRatePerRoll,
+    derivedRatePerRoll,
+    finalRatePerRoll,
     // lineTotal is tax-EXCLUSIVE; lineTax and lineGrossTotal allow UI to show both
     lineTotal,
     lineTax,
@@ -228,7 +319,7 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
 
   // Process lines with pricing calculation
   let subtotal = 0;
-  let taxAmount = 0;
+  const taxAmount = 0;
 
   const processedLines = [];
 
@@ -260,14 +351,10 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
     );
 
     const lineTotal = pricing.lineTotal;
-    // taxRate lives on Product, fall back to SKU taxRate if available
-    const taxRate = sku.productId?.taxRate ?? sku.taxRate ?? 0;
-    const lineTax = lineTotal * (taxRate / 100);
 
     subtotal += lineTotal;
-    taxAmount += lineTax;
 
-    processedLines.push(await buildProcessedLine(line, sku, lineTotal, lineTax));
+    processedLines.push(await buildProcessedLine(line, sku, lineTotal, 0));
   }
 
   // Populate customerGroupId if it exists
@@ -296,7 +383,7 @@ const createSalesOrder = handleAsyncErrors(async (req, res) => {
     discountPercent: Number(discountPercent) || 0,
     discountAmount,
     taxAmount,
-    total: subtotal - discountAmount + taxAmount,
+    total: subtotal - discountAmount,
     dueDays: dueDays != null ? Number(dueDays) : defaultDueDays,
     creditCheckPassed: false, // Will be updated on confirmation
     notes,
@@ -341,7 +428,7 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
   }
 
   let subtotal = 0;
-  let taxAmount = 0;
+  const taxAmount = 0;
   const processedLines = [];
 
   for (const line of lines) {
@@ -371,13 +458,10 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
     );
 
     const lineTotal = pricing.lineTotal;
-    const taxRate = sku.productId?.taxRate ?? sku.taxRate ?? 0;
-    const lineTax = lineTotal * (taxRate / 100);
 
     subtotal += lineTotal;
-    taxAmount += lineTax;
 
-    processedLines.push(await buildProcessedLine(line, sku, lineTotal, lineTax));
+    processedLines.push(await buildProcessedLine(line, sku, lineTotal, 0));
   }
 
   const discountAmount = (subtotal * (Number(discountPercent) || 0)) / 100;
@@ -394,7 +478,7 @@ const updateSalesOrder = handleAsyncErrors(async (req, res) => {
   salesOrder.discountPercent = Number(discountPercent) || 0;
   salesOrder.discountAmount = discountAmount;
   salesOrder.taxAmount = taxAmount;
-  salesOrder.total = subtotal - discountAmount + taxAmount;
+  salesOrder.total = subtotal - discountAmount;
   salesOrder.dueDays = dueDays != null ? Number(dueDays) : (salesOrder.dueDays ?? defaultDueDays);
   salesOrder.notes = notes;
   salesOrder.creditCheckNotes = req.body.creditCheckNotes;
@@ -440,76 +524,8 @@ const confirmSalesOrder = handleAsyncErrors(async (req, res) => {
     throw new AppError("Only draft sales orders can be confirmed", 400, "INVALID_STATE_TRANSITION");
   }
 
-  // Credit check: compare (outstanding AR + pending SO + this SO) against limit
-  const customer = await Customer.findById(salesOrder.customerId);
-  let creditCheckPassed = true;
-  let creditCheckNotes = "";
-
-  if (customer && customer.creditPolicy) {
-    const policy = customer.creditPolicy;
-
-    if (policy.isBlocked) {
-      throw new AppError(
-        "Customer is blocked — cannot confirm order",
-        400,
-        "CUSTOMER_BLOCKED"
-      );
-    }
-
-    const creditLimit = Number(policy.creditLimit) || 0;
-    if (creditLimit > 0) {
-      // Count pending SO value from other confirmed/partially-fulfilled SOs
-      const outstandingSOs = await SalesOrder.aggregate([
-        {
-          $match: {
-            customerId: salesOrder.customerId,
-            _id: { $ne: salesOrder._id },
-            status: { $in: ["Confirmed", "PartiallyFulfilled"] },
-          },
-        },
-        { $group: { _id: null, total: { $sum: "$total" } } },
-      ]);
-      const pendingSOValue = outstandingSOs[0]?.total || 0;
-
-      // Count outstanding AR from posted invoices
-      const SalesInvoice = require("../models/SalesInvoice");
-      const outstandingAgg = await SalesInvoice.aggregate([
-        {
-          $match: {
-            customerId: salesOrder.customerId,
-            status: "Posted",
-            paymentStatus: { $ne: "Paid" },
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            total: {
-              $sum: {
-                $cond: [
-                  { $gt: ["$outstandingAmount", 0] },
-                  "$outstandingAmount",
-                  {
-                    $subtract: [
-                      { $ifNull: ["$total", 0] },
-                      { $ifNull: ["$paidAmount", 0] },
-                    ],
-                  },
-                ],
-              },
-            },
-          },
-        },
-      ]);
-      const outstandingAR = outstandingAgg[0]?.total || 0;
-      const exposureAfterConfirm = outstandingAR + pendingSOValue + (salesOrder.total || 0);
-
-      if (exposureAfterConfirm > creditLimit) {
-        creditCheckPassed = false;
-        creditCheckNotes = `Credit limit ₹${creditLimit.toLocaleString("en-IN")} would be exceeded. Current exposure: ₹${(outstandingAR + pendingSOValue).toLocaleString("en-IN")}, this order: ₹${(salesOrder.total || 0).toLocaleString("en-IN")}.`;
-      }
-    }
-  }
+  const { creditCheckPassed, creditCheckNotes } =
+    await runCreditCheckForSalesOrder(salesOrder);
 
   salesOrder.status = creditCheckPassed ? "Confirmed" : STATUS.ON_HOLD;
   if (!creditCheckPassed) {
@@ -519,6 +535,46 @@ const confirmSalesOrder = handleAsyncErrors(async (req, res) => {
   salesOrder.creditCheckNotes = creditCheckNotes || salesOrder.creditCheckNotes;
   salesOrder.confirmedBy = req.user ? req.user._id : undefined;
   salesOrder.confirmedAt = new Date();
+  await salesOrder.save();
+
+  res.json({
+    success: true,
+    data: salesOrder,
+  });
+});
+
+// Re-check credit for an OnHold sales order and release if it passes
+const recheckSalesOrderCredit = handleAsyncErrors(async (req, res) => {
+  const salesOrder = await SalesOrder.findById(req.params.id);
+
+  if (!salesOrder) {
+    throw new AppError("Sales order not found", 404, "RESOURCE_NOT_FOUND");
+  }
+
+  if (salesOrder.status !== STATUS.ON_HOLD) {
+    throw new AppError(
+      "Only OnHold sales orders can be re-checked",
+      400,
+      "INVALID_STATE_TRANSITION"
+    );
+  }
+
+  const { creditCheckPassed, creditCheckNotes } =
+    await runCreditCheckForSalesOrder(salesOrder);
+
+  salesOrder.creditCheckPassed = creditCheckPassed;
+  salesOrder.creditCheckNotes = creditCheckNotes || salesOrder.creditCheckNotes;
+
+  if (creditCheckPassed) {
+    salesOrder.status = STATUS.CONFIRMED;
+    salesOrder.onHoldReason = undefined;
+    salesOrder.confirmedBy = req.user ? req.user._id : undefined;
+    salesOrder.confirmedAt = new Date();
+  } else {
+    salesOrder.status = STATUS.ON_HOLD;
+    salesOrder.onHoldReason = creditCheckNotes || "Credit check failed";
+  }
+
   await salesOrder.save();
 
   res.json({
@@ -668,6 +724,7 @@ module.exports = {
   createSalesOrder,
   updateSalesOrder,
   confirmSalesOrder,
+  recheckSalesOrderCredit,
   cancelSalesOrder,
   holdSalesOrder,
   closeSalesOrder,

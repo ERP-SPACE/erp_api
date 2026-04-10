@@ -31,6 +31,36 @@ class NumberingService {
     return `${pattern}-${String(sequence).padStart(4, "0")}`;
   }
 
+  /**
+   * Generate a sequential number in the format: PREFIX/YY-YY/##### (financial year).
+   * FY is computed based on the provided date (defaults to today), with FY starting April 1st.
+   */
+  async generateFiscalYearNumber(prefix, model, fieldName, date = new Date()) {
+    const d = moment(date);
+    const fiscalStartYear = d.month() >= 3 ? d.year() : d.year() - 1; // month is 0-based
+    const fy = `${String(fiscalStartYear).slice(-2)}-${String(fiscalStartYear + 1).slice(-2)}`;
+    const pattern = `${prefix}/${fy}/`;
+
+    const numberField = fieldName || `${prefix.toLowerCase()}Number`;
+
+    const lastDoc = await model
+      .findOne({
+        [numberField]: new RegExp(`^${pattern.replace("/", "\\/")}`),
+      })
+      .sort({ [numberField]: -1 });
+
+    let sequence = 1;
+    if (lastDoc?.[numberField]) {
+      const lastNumber = lastDoc[numberField];
+      const lastSequence = parseInt(String(lastNumber).split("/").pop(), 10);
+      if (!Number.isNaN(lastSequence)) {
+        sequence = lastSequence + 1;
+      }
+    }
+
+    return `${pattern}${String(sequence).padStart(5, "0")}`;
+  }
+
   generateSupplierCode(sequence) {
     return `SUP-${String(sequence).padStart(4, "0")}`;
   }

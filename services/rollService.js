@@ -190,7 +190,17 @@ class RollService {
 
     // Apply filters
     if (filters.status) {
-      query.status = filters.status;
+      const raw = Array.isArray(filters.status)
+        ? filters.status
+        : String(filters.status);
+      const parts = Array.isArray(raw)
+        ? raw
+        : raw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+      query.status = parts.length > 1 ? { $in: parts } : parts[0];
     }
 
     if (filters.skuId) {
@@ -499,6 +509,7 @@ class RollService {
         $group: {
           _id: {
             status: "$status",
+            skuId: "$skuId",
             skuCode: "$sku.skuCode",
             categoryName: "$category.name",
             gsm: "$gsm.name",
@@ -507,10 +518,18 @@ class RollService {
           },
           totalRolls: { $sum: 1 },
           totalMeters: { $sum: "$currentLengthMeters" },
-          totalValue: { 
-            $sum: { 
-              $multiply: ["$landedCostPerMeter", "$currentLengthMeters"] 
-            } 
+          // Inventory value should align with the roll's landed cost stored on the roll.
+          // IMPORTANT:
+          // `totalLandedCost` can become stale if `currentLengthMeters` is later adjusted (returns, consumption, etc).
+          // So compute value from landedCostPerMeter × currentLengthMeters whenever landedCostPerMeter is present.
+          totalValue: {
+            $sum: {
+              $cond: [
+                { $gt: ["$landedCostPerMeter", 0] },
+                { $multiply: ["$landedCostPerMeter", "$currentLengthMeters"] },
+                { $ifNull: ["$totalLandedCost", 0] },
+              ],
+            },
           },
         },
       },

@@ -20,6 +20,23 @@ const findAndPopulateDC = async (id) => {
   return DeliveryChallan.findById(id).populate(dcPopulate);
 };
 
+const recomputeSalesOrderFulfillmentStatus = (salesOrder) => {
+  const totalQty = (salesOrder.lines || []).reduce(
+    (sum, l) => sum + (Number(l.qtyRolls) || 0),
+    0
+  );
+  const dispatchedQty = (salesOrder.lines || []).reduce(
+    (sum, l) => sum + (Number(l.dispatchedQty) || 0),
+    0
+  );
+
+  if (dispatchedQty >= totalQty && totalQty > 0) {
+    salesOrder.status = STATUS.CLOSED;
+  } else if (dispatchedQty > 0) {
+    salesOrder.status = STATUS.PARTIALLY_FULFILLED;
+  }
+};
+
 // Get all delivery challans with basic filters
 const getDeliveryChallans = handleAsyncErrors(async (req, res) => {
   const { status, salesOrderId, customerId } = req.query;
@@ -62,7 +79,7 @@ const getDeliveryChallan = handleAsyncErrors(async (req, res) => {
   });
 });
 
-// Create delivery challan & mark rolls dispatched
+// Create delivery challan draft (no stock impact)
 const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
   const {
     salesOrderId,
@@ -91,12 +108,14 @@ const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
     );
   }
 
-  const dcNumber = await numberingService.generateNumber(
+  const dcNumber = await numberingService.generateFiscalYearNumber(
     "DC",
-    DeliveryChallan
+    DeliveryChallan,
+    "dcNumber",
+    dcDate
   );
 
-  // Validate lines & update dispatched quantities in-memory
+  // Validate lines (draft stores planned rollIds but does not change Roll/SO)
   const processedLines = [];
   for (const line of lines) {
     const roll = await Roll.findById(line.rollId);
@@ -110,8 +129,20 @@ const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
         (l) => l._id?.toString() === line.soLineId?.toString()
       );
 
-    if (soLine) {
-      soLine.dispatchedQty = (soLine.dispatchedQty || 0) + 1;
+    if (!soLine) {
+      throw new AppError(
+        `SO line not found for roll ${roll.rollNumber}`,
+        400,
+        "VALIDATION_ERROR"
+      );
+    }
+
+    if (!["Mapped", "Allocated"].includes(roll.status)) {
+      throw new AppError(
+        `Roll ${roll.rollNumber} is not available for dispatch (status: ${roll.status})`,
+        400,
+        "INVALID_ROLL_STATUS"
+      );
     }
 
     processedLines.push({
@@ -121,7 +152,7 @@ const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
       skuId: roll.skuId,
       widthInches: roll.widthInches,
       shippedLengthMeters: line.shippedLengthMeters || roll.currentLengthMeters,
-      shippedStatus: line.shippedStatus || "Dispatched",
+      shippedStatus: line.shippedStatus || "Packed",
     });
   }
 
@@ -132,7 +163,7 @@ const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
     customerId: salesOrder.customerId,
     customerName: salesOrder.customerName,
     dcDate,
-    status: STATUS.OPEN,
+    status: STATUS.DRAFT,
     lines: processedLines,
     vehicleNumber,
     driverName,
@@ -141,46 +172,93 @@ const createDeliveryChallan = handleAsyncErrors(async (req, res) => {
     createdBy: req.user ? req.user._id : undefined,
   });
 
-  // Update roll statuses & dispatch details
-  for (const line of processedLines) {
-    await Roll.findByIdAndUpdate(
-      line.rollId,
-      {
-        status: "Dispatched",
-        dispatchDetails: {
-          dcId: challan._id,
-          dispatchedAt: new Date(dcDate),
-          dispatchedBy: req.user ? req.user._id : undefined,
-        },
-      },
-      { new: true }
-    );
-  }
-
-  // Update sales order status based on dispatched quantities
-  const totalQty = salesOrder.lines.reduce(
-    (sum, l) => sum + (Number(l.qtyRolls) || 0),
-    0
-  );
-  const dispatchedQty = salesOrder.lines.reduce(
-    (sum, l) => sum + (Number(l.dispatchedQty) || 0),
-    0
-  );
-
-  if (dispatchedQty >= totalQty && totalQty > 0) {
-    salesOrder.status = STATUS.CLOSED;
-  } else if (dispatchedQty > 0) {
-    salesOrder.status = STATUS.PARTIALLY_FULFILLED;
-  }
-
-  await salesOrder.save();
-
   const populated = await findAndPopulateDC(challan._id);
 
   res.status(201).json({
     success: true,
     data: populated,
   });
+});
+
+// Post delivery challan: mark rolls dispatched and update SO cumulative dispatched qty
+const postDeliveryChallan = handleAsyncErrors(async (req, res) => {
+  const challan = await DeliveryChallan.findById(req.params.id);
+
+  if (!challan) {
+    throw new AppError("Delivery challan not found", 404, "RESOURCE_NOT_FOUND");
+  }
+
+  if (challan.status !== STATUS.DRAFT) {
+    throw new AppError(
+      "Only draft delivery challans can be posted",
+      400,
+      "INVALID_STATE_TRANSITION"
+    );
+  }
+
+  const salesOrder = await SalesOrder.findById(challan.salesOrderId);
+  if (!salesOrder) {
+    throw new AppError("Sales order not found", 404, "RESOURCE_NOT_FOUND");
+  }
+
+  if (!Array.isArray(challan.lines) || challan.lines.length === 0) {
+    throw new AppError(
+      "Cannot post a delivery challan with no lines",
+      400,
+      "VALIDATION_ERROR"
+    );
+  }
+
+  // Validate & apply dispatch
+  for (const line of challan.lines) {
+    const roll = await Roll.findById(line.rollId);
+    if (!roll) {
+      throw new AppError(`Roll not found: ${line.rollId}`, 404, "RESOURCE_NOT_FOUND");
+    }
+
+    if (!["Mapped", "Allocated"].includes(roll.status)) {
+      throw new AppError(
+        `Roll ${roll.rollNumber} is not available for dispatch (status: ${roll.status})`,
+        400,
+        "INVALID_ROLL_STATUS"
+      );
+    }
+
+    // Update roll status & dispatch details
+    await Roll.findByIdAndUpdate(
+      roll._id,
+      {
+        status: "Dispatched",
+        dispatchDetails: {
+          dcId: challan._id,
+          dispatchedAt: new Date(challan.dcDate),
+          dispatchedBy: req.user ? req.user._id : undefined,
+        },
+      },
+      { new: true }
+    );
+
+    // Update sales order line dispatched qty (1 per roll)
+    const soLine =
+      salesOrder.lines.id(line.soLineId) ||
+      salesOrder.lines.find((l) => l._id?.toString() === line.soLineId?.toString());
+    if (soLine) {
+      soLine.dispatchedQty = (soLine.dispatchedQty || 0) + 1;
+    }
+  }
+
+  recomputeSalesOrderFulfillmentStatus(salesOrder);
+  await salesOrder.save();
+
+  challan.status = STATUS.POSTED;
+  // Mark all shippedStatus as Dispatched when posted
+  (challan.lines || []).forEach((l) => {
+    l.shippedStatus = "Dispatched";
+  });
+  await challan.save();
+
+  const populated = await findAndPopulateDC(challan._id);
+  res.json({ success: true, data: populated });
 });
 
 // Update delivery challan details (metadata only)
@@ -241,6 +319,7 @@ module.exports = {
   getDeliveryChallans,
   getDeliveryChallan,
   createDeliveryChallan,
+  postDeliveryChallan,
   updateDeliveryChallan,
   closeDeliveryChallan,
 };

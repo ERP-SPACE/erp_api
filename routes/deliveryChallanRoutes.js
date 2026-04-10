@@ -5,6 +5,7 @@ const {
   getDeliveryChallans,
   getDeliveryChallan,
   createDeliveryChallan,
+  postDeliveryChallan,
   updateDeliveryChallan,
   closeDeliveryChallan,
 } = require("../controllers/deliveryChallanController");
@@ -22,6 +23,7 @@ router
   .get(getDeliveryChallan)
   .put(updateDeliveryChallan);
 
+router.post("/:id/post", postDeliveryChallan);
 router.post("/:id/close", closeDeliveryChallan);
 
 module.exports = router;

@@ -6,7 +6,7 @@ const AppError = require("../utils/AppError");
 class PricingService {
   /**
    * Lightweight sales pricing calculation given a 44" base rate and dimensions.
-   * Mirrors the UI logic: 44" benchmark → derived rate per roll → line total.
+   * Mirrors the UI logic: 44" benchmark → derived rate for selected width → line total.
    * Tax is handled by the caller after this returns.
    */
   calculateSalesPricing(
@@ -21,19 +21,24 @@ class PricingService {
     const length = Number(lengthMetersPerRoll) || 0;
     const base = Number(benchmarkRate44) || 0;
 
-    const derivedRatePerRoll = width > 0 ? Math.round(base * (width / 44)) : 0;
-    const finalRatePerRoll =
+    // UI behavior: keep 2 decimals for width-derived rate
+    const derivedRate =
+      width > 0
+        ? Math.round((base * (width / 44) + Number.EPSILON) * 100) / 100
+        : 0;
+    const finalRate =
       overrideRatePerRoll !== undefined && overrideRatePerRoll !== null
         ? Number(overrideRatePerRoll) || 0
-        : derivedRatePerRoll;
+        : derivedRate;
 
-    const lineTotal = finalRatePerRoll * qty;
+    const totalMeters = length * qty;
+    const lineTotal = totalMeters * finalRate;
 
     return {
-      derivedRatePerRoll,
-      finalRatePerRoll,
+      derivedRate,
+      finalRate,
       lineTotal,
-      totalMeters: length * qty,
+      totalMeters,
     };
   }
 
