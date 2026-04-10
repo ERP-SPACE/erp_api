@@ -38,6 +38,21 @@ const purchaseOrderSchema = new mongoose.Schema(
           type: mongoose.Schema.Types.ObjectId,
           ref: "SKU",
         },
+        // Supplier benchmark base rate for 44" width (used to derive rate for other widths)
+        baseRate44: {
+          type: Number,
+          default: 0,
+        },
+        // Derived rate based on width: baseRate44 * (widthInches / 44)
+        derivedRatePerRoll: {
+          type: Number,
+          default: 0,
+        },
+        // Optional manual override of derivedRatePerRoll
+        overrideRatePerRoll: {
+          type: Number,
+          default: null,
+        },
         lineStatus: {
           type: String,
           enum: ["Pending", "Complete"],
@@ -47,6 +62,12 @@ const purchaseOrderSchema = new mongoose.Schema(
         gsm: String,
         qualityName: String,
         widthInches: Number,
+        bifurcations: [
+          {
+            rollQty: { type: Number, default: 0 },
+            metersPerRoll: { type: Number, default: 0 },
+          },
+        ],
         lengthMetersPerRoll: {
           type: Number,
           default: 0,

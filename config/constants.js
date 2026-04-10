@@ -36,6 +36,7 @@ module.exports = {
     ALLOCATED: "Allocated",
     DISPATCHED: "Dispatched",
     RETURNED: "Returned",
+    RETURNED_TO_SUPPLIER: "ReturnedToSupplier",
     SCRAP: "Scrap",
   },
 

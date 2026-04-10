@@ -205,6 +205,10 @@ class RollService {
       query.batchId = filters.batchId;
     }
 
+    if (filters.purchaseInvoiceId) {
+      query.purchaseInvoiceId = filters.purchaseInvoiceId;
+    }
+
     if (filters.barcode) {
       query.barcode = { $regex: filters.barcode, $options: "i" };
     }

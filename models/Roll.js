@@ -51,6 +51,7 @@ const rollSchema = new mongoose.Schema(
         "Allocated",
         "Dispatched",
         "Returned",
+        "ReturnedToSupplier",
         "Scrap",
       ],
       default: "Unmapped",

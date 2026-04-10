@@ -22,6 +22,7 @@ class RollController {
       skuId: req.query.skuId,
       supplierId: req.query.supplierId,
       batchId: req.query.batchId,
+      purchaseInvoiceId: req.query.purchaseInvoiceId,
       barcode: req.query.barcode,
       unmappedDays: req.query.unmappedDays
         ? parseInt(req.query.unmappedDays)

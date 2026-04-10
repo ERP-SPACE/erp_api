@@ -85,6 +85,20 @@ const sanitizeNumber = (value) => {
   return Number(value) || 0;
 };
 
+const deriveWidthRate = (baseRate44, widthInches) => {
+  const base = sanitizeNumber(baseRate44);
+  const width = sanitizeNumber(widthInches);
+  if (!base || !width) return 0;
+  return Math.round(base * (width / 44) * 100) / 100;
+};
+
+const normalizeNullableNumber = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = sanitizeNumber(value);
+  return n === 0 ? 0 : n;
+};
+
 const deriveOrderStatusFromLines = (lines = []) => {
   if (!Array.isArray(lines) || lines.length === 0) {
     return PURCHASE_ORDER_STATUS.DRAFT;
@@ -221,9 +235,20 @@ const createPurchaseOrder = handleAsyncErrors(async (req, res) => {
 
   const processedLines = (lines || []).map((line = {}) => {
     const qtyRolls = sanitizeNumber(line.qtyRolls);
-    const ratePerRoll = sanitizeNumber(line.ratePerRoll);
+    const overrideRatePerRoll = normalizeNullableNumber(line.overrideRatePerRoll);
+    const baseRate44 = sanitizeNumber(line.baseRate44);
+    const derivedRatePerRoll =
+      sanitizeNumber(line.derivedRatePerRoll) ||
+      deriveWidthRate(baseRate44, line.widthInches);
+    const finalRatePerRoll =
+      overrideRatePerRoll !== null && overrideRatePerRoll !== undefined
+        ? sanitizeNumber(overrideRatePerRoll)
+        : derivedRatePerRoll || sanitizeNumber(line.ratePerRoll);
+    const ratePerRoll = finalRatePerRoll;
     const lengthMetersPerRoll = sanitizeNumber(line.lengthMetersPerRoll);
-    const lineMeters = qtyRolls * lengthMetersPerRoll;
+    const incomingTotalMeters = sanitizeNumber(line.totalMeters);
+    const lineMeters =
+      incomingTotalMeters > 0 ? incomingTotalMeters : qtyRolls * lengthMetersPerRoll;
     const lineTotal = lineMeters * ratePerRoll;
     const lineStatus =
       typeof line.lineStatus === "string" && line.lineStatus.trim()
@@ -242,6 +267,9 @@ const createPurchaseOrder = handleAsyncErrors(async (req, res) => {
     return {
       ...restLine,
       ...(skuId ? { skuId } : {}),
+      baseRate44,
+      derivedRatePerRoll,
+      overrideRatePerRoll,
       qtyRolls,
       ratePerRoll,
       lengthMetersPerRoll,
@@ -327,9 +355,20 @@ const updatePurchaseOrder = handleAsyncErrors(async (req, res) => {
 
     const processedLines = (lines || []).map((line = {}) => {
       const qtyRolls = sanitizeNumber(line.qtyRolls);
-      const ratePerRoll = sanitizeNumber(line.ratePerRoll);
+      const overrideRatePerRoll = normalizeNullableNumber(line.overrideRatePerRoll);
+      const baseRate44 = sanitizeNumber(line.baseRate44);
+      const derivedRatePerRoll =
+        sanitizeNumber(line.derivedRatePerRoll) ||
+        deriveWidthRate(baseRate44, line.widthInches);
+      const finalRatePerRoll =
+        overrideRatePerRoll !== null && overrideRatePerRoll !== undefined
+          ? sanitizeNumber(overrideRatePerRoll)
+          : derivedRatePerRoll || sanitizeNumber(line.ratePerRoll);
+      const ratePerRoll = finalRatePerRoll;
       const lengthMetersPerRoll = sanitizeNumber(line.lengthMetersPerRoll);
-      const lineMeters = qtyRolls * lengthMetersPerRoll;
+      const incomingTotalMeters = sanitizeNumber(line.totalMeters);
+      const lineMeters =
+        incomingTotalMeters > 0 ? incomingTotalMeters : qtyRolls * lengthMetersPerRoll;
       const lineTotal = lineMeters * ratePerRoll;
       const lineStatus =
         typeof line.lineStatus === "string" && line.lineStatus.trim()
@@ -346,6 +385,9 @@ const updatePurchaseOrder = handleAsyncErrors(async (req, res) => {
       return {
         ...restLine,
         ...(skuId ? { skuId } : {}),
+        baseRate44,
+        derivedRatePerRoll,
+        overrideRatePerRoll,
         qtyRolls,
         ratePerRoll,
         lengthMetersPerRoll,
